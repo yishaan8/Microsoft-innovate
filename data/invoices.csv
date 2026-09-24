@@ -1,0 +1,11 @@
+invoice_id,vendor_name,invoice_date,due_date,amount,currency,category,description
+INV001,ABC Supplies,2026-09-01,2026-09-30,12500,INR,Office Supplies,Printer paper and stationery
+INV002,Tech Solutions,2026-09-03,2026-10-03,45000,INR,Software,Annual software subscription
+INV003,Global Services,2026-09-05,2026-10-05,78000,INR,Consulting,Consulting services
+INV004,ABC Supplies,2026-09-07,2026-10-07,12500,INR,Office Supplies,Printer paper and stationery
+INV005,Cloud Systems,2026-09-10,2026-10-10,25000,INR,Cloud Services,Cloud hosting charges
+INV006,Marketing Hub,2026-09-12,2026-10-12,32000,INR,Marketing,Digital marketing services
+INV007,Tech Solutions,2026-09-15,2026-10-15,45000,INR,Software,Annual software subscription
+INV008,Office World,2026-09-18,2026-10-18,,INR,Office Supplies,Office equipment
+INV009,Cloud Systems,invalid-date,2026-10-20,18000,INR,Cloud Services,Cloud hosting charges
+INV010,,2026-09-20,2026-10-20,15000,INR,Travel,Business travel expenses
