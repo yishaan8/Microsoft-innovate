@@ -1,20 +1,22 @@
 import pandas as pd
 
+
 REQUIRED_FIELDS = [
     "invoice_id",
-    "vendor_name",
+    "supplier_id",
+    "department_id",
     "invoice_date",
-    "due_date",
-    "amount",
+    "invoice_amount",
     "currency",
-    "category",
-    "description"
+    "payment_terms",
+    "invoice_type",
+    "submission_hour",
 ]
 
 
 def validate_required_fields(row):
     """
-    Check whether all required fields exist and contain values.
+    Check whether all required invoice fields exist and contain values.
 
     Returns:
         List of validation error dictionaries.
@@ -25,7 +27,6 @@ def validate_required_fields(row):
     invoice_id = row.get("invoice_id")
 
     for field in REQUIRED_FIELDS:
-
         value = row.get(field)
 
         if pd.isna(value) or str(value).strip() == "":

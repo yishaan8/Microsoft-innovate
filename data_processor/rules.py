@@ -1,19 +1,17 @@
 import pandas as pd
 
 
-# Policy limit for invoice amount
-POLICY_LIMIT = 100000
-
-
-# Required fields for an invoice
+# Required fields for the new procurement invoice dataset
 REQUIRED_FIELDS = [
-    "vendor_name",
+    "invoice_id",
+    "supplier_id",
+    "department_id",
     "invoice_date",
-    "due_date",
-    "amount",
+    "invoice_amount",
     "currency",
-    "category",
-    "description"
+    "payment_terms",
+    "invoice_type",
+    "submission_hour",
 ]
 
 
@@ -36,22 +34,26 @@ def check_missing_fields(row):
     return errors
 
 
-def check_policy_limit(row, policy_limit=100000):
+def check_policy_limit(row, policy_limit=None):
     """
-    Check whether the invoice amount exceeds the policy limit.
+    Check whether the invoice amount exceeds a configured policy limit.
+
+    The policy limit is optional because the selected dataset does not
+    provide a documented per-invoice company policy limit.
 
     Args:
         row: Invoice row.
-        policy_limit: Maximum allowed invoice amount.
-                       Default is 100000.
+        policy_limit: Optional maximum allowed invoice amount.
 
     Returns:
         List of policy violation messages.
     """
 
-    amount = row.get("amount")
+    if policy_limit is None:
+        return []
 
-    # If amount is missing, missing-field validation handles it
+    amount = row.get("invoice_amount")
+
     if pd.isna(amount) or str(amount).strip() == "":
         return []
 
@@ -68,13 +70,90 @@ def check_policy_limit(row, policy_limit=100000):
     return []
 
 
+def check_blacklisted_supplier(row):
+    """
+    Check whether the supplier is blacklisted.
+
+    Returns:
+        List containing an exception message if the supplier is blacklisted.
+    """
+
+    flag = row.get("blacklisted_flag")
+
+    if pd.isna(flag):
+        return []
+
+    try:
+        flag = int(flag)
+    except (ValueError, TypeError):
+        return []
+
+    if flag == 1:
+        return ["Supplier is blacklisted"]
+
+    return []
+
+
+def check_supplier_risk(row, risk_threshold=0.8):
+    """
+    Check whether supplier risk score exceeds the configured threshold.
+
+    Note:
+        The threshold is an engineering rule for the MVP and is not
+        presented as an official business policy from the dataset.
+
+    Returns:
+        List containing a risk exception when applicable.
+    """
+
+    risk_score = row.get("supplier_risk_score")
+
+    if pd.isna(risk_score):
+        return []
+
+    try:
+        risk_score = float(risk_score)
+    except (ValueError, TypeError):
+        return []
+
+    if risk_score > risk_threshold:
+        return [
+            f"Supplier risk score {risk_score:.2f} exceeds threshold "
+            f"of {risk_threshold:.2f}"
+        ]
+
+    return []
+
+
+def check_submission_hour(row):
+    """
+    Check whether the invoice submission hour is valid.
+
+    Valid hours are 0 through 23.
+    """
+
+    hour = row.get("submission_hour")
+
+    if pd.isna(hour):
+        return []
+
+    try:
+        hour = float(hour)
+    except (ValueError, TypeError):
+        return ["Invalid submission hour"]
+
+    if not 0 <= hour <= 23:
+        return ["Invalid submission hour"]
+
+    return []
+
+
 def find_exact_duplicates(df):
     """
     Find exact duplicate invoice records.
 
-    The invoice_id is ignored while checking for duplicates because
-    two invoices with different IDs can still contain identical
-    invoice information.
+    invoice_id is ignored so that two different invoice IDs containing
+    otherwise identical invoice information can still be detected.
 
     Returns:
         Set containing the row indices of duplicate records.
@@ -83,8 +162,6 @@ def find_exact_duplicates(df):
     if df.empty:
         return set()
 
-    # Columns used to determine whether two invoice records
-    # contain exactly the same information.
     duplicate_columns = [
         column
         for column in df.columns
@@ -102,14 +179,21 @@ def find_exact_duplicates(df):
     return set(df.index[duplicate_rows])
 
 
-def run_rule_engine(df, policy_limit=100000):
+def run_rule_engine(
+    df,
+    policy_limit=None,
+    risk_threshold=0.8
+):
     """
-    Apply all business rules to every invoice.
+    Apply deterministic business rules to every invoice.
 
     Rules:
     1. Missing required fields
-    2. Policy limit violation
-    3. Exact duplicate detection
+    2. Optional policy-limit violation
+    3. Blacklisted supplier
+    4. High supplier risk
+    5. Invalid submission hour
+    6. Exact duplicate detection
 
     Returns:
         DataFrame containing:
@@ -121,7 +205,6 @@ def run_rule_engine(df, policy_limit=100000):
 
     results = []
 
-    # Find duplicate rows once for the complete DataFrame
     duplicate_indices = find_exact_duplicates(df)
 
     for index, row in df.iterrows():
@@ -131,18 +214,36 @@ def run_rule_engine(df, policy_limit=100000):
         exceptions = []
 
         # Rule 1: Missing required fields
-        missing_errors = check_missing_fields(row)
-        exceptions.extend(missing_errors)
+        exceptions.extend(
+            check_missing_fields(row)
+        )
 
-        # Rule 2: Policy limit
-        policy_errors = check_policy_limit(row, policy_limit)
-        exceptions.extend(policy_errors)
+        # Rule 2: Optional policy limit
+        exceptions.extend(
+            check_policy_limit(row, policy_limit)
+        )
 
-        # Rule 3: Exact duplicate
+        # Rule 3: Blacklisted supplier
+        exceptions.extend(
+            check_blacklisted_supplier(row)
+        )
+
+        # Rule 4: Supplier risk
+        exceptions.extend(
+            check_supplier_risk(row, risk_threshold)
+        )
+
+        # Rule 5: Submission hour
+        exceptions.extend(
+            check_submission_hour(row)
+        )
+
+        # Rule 6: Exact duplicate
         if index in duplicate_indices:
-            exceptions.append("Exact duplicate invoice detected")
+            exceptions.append(
+                "Exact duplicate invoice detected"
+            )
 
-        # Determine final status
         if exceptions:
             status = "EXCEPTION"
         else:
