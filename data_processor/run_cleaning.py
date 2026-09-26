@@ -1,18 +1,28 @@
-from cleaner import clean_invoices
+import pandas as pd
+
+from data_processor.cleaner import clean_invoices
 
 
-INPUT_FILE = "data/raw/invoices.parquet"
+INPUT_FILE = "data/processed/invoices_master.parquet"
 OUTPUT_FILE = "data/processed/invoices_cleaned.parquet"
 
 
-df = clean_invoices(INPUT_FILE, OUTPUT_FILE)
+# Load merged dataset
+df = pd.read_parquet(INPUT_FILE)
+
+# Clean dataset
+cleaned_df = clean_invoices(
+    df,
+    output_path=OUTPUT_FILE
+)
 
 print("Cleaning completed successfully!")
-print("Final shape:", df.shape)
+print("Original shape:", df.shape)
+print("Cleaned shape:", cleaned_df.shape)
 print("Output file:", OUTPUT_FILE)
 
 print("\nMissing values:")
-print(df.isna().sum())
+print(cleaned_df.isna().sum())
 
 print("\nDuplicate invoice IDs:")
-print(df["invoice_id"].duplicated().sum())
+print(cleaned_df["invoice_id"].duplicated().sum())
