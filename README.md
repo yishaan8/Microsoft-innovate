@@ -2,11 +2,13 @@
 
 ## Project Overview
 
-AP Exception Intelligence is a Python-based invoice processing system that loads invoice data, cleans and standardizes the data, validates required fields, and applies deterministic business rules to identify invoice exceptions.
+AP Exception Intelligence is a Python-based invoice processing system designed to identify exceptions in procurement invoice data.
 
-The system processes invoice records through the following pipeline:
+The system loads procurement invoice data, merges related supplier and department information, cleans and validates the data, and applies deterministic business rules to identify invoice exceptions.
 
-**Load → Clean → Validate → Apply Rules → Generate Results**
+The current data-processing pipeline is:
+
+**Raw Parquet Data → Merge → Clean → Validate → Apply Rules → Generate Results**
 
 The project is designed as a modular data-processing system where each stage has a separate responsibility.
 
@@ -16,40 +18,34 @@ The project is designed as a modular data-processing system where each stage has
 
 The main objectives of the project are:
 
-- Load invoice data from CSV and Excel files.
+- Load procurement invoice data from Parquet files.
+- Merge invoice, supplier, department, and label datasets.
 - Clean and standardize invoice data.
 - Validate required invoice fields.
 - Detect missing or invalid fields.
-- Apply deterministic business rules.
-- Detect invoice amounts exceeding a configurable policy limit.
-- Detect exact duplicate invoices.
-- Generate a common input/output format for downstream modules.
+- Detect blacklisted suppliers.
+- Detect suppliers with high risk scores.
+- Detect invalid invoice submission hours.
+- Detect exact duplicate invoice records.
+- Support an optional configurable invoice policy limit.
+- Generate a common rule-engine output format for downstream modules.
 - Provide automated tests for the implemented functionality.
 
 ---
 
-## Project Structure
+## Dataset
+
+The project uses a procurement invoice fraud dataset containing:
+
+- **300,000 invoices**
+- **2,000 suppliers**
+- **50 departments**
+
+The selected data files are:
 
 ```text
-AP_Exception_Intelligence/
-│
-├── data/
-│   └── invoices.csv
-│
-├── data_processor/
-│   ├── __init__.py
-│   ├── loader.py
-│   ├── cleaner.py
-│   ├── validator.py
-│   ├── rules.py
-│   └── pipeline.py
-│
-├── tests/
-│   ├── __init__.py
-│   ├── test_cleaner.py
-│   ├── test_loader.py
-│   ├── test_rules.py
-│   └── test_validator.py
-│
-├── .gitignore
-└── README.md
+data/raw/
+├── invoices.parquet
+├── suppliers.parquet
+├── departments.parquet
+└── labels.parquet
