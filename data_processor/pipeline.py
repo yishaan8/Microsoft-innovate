@@ -11,7 +11,7 @@ def process_file(
     risk_threshold=0.8
 ):
     """
-    Process a cleaned/master procurement invoice Parquet file.
+    Process a procurement invoice Parquet file.
 
     Steps:
     1. Load Parquet file
@@ -27,11 +27,19 @@ def process_file(
     # Step 2: Clean data
     df = clean_invoices(df)
 
-    # Step 3: Apply business rules
+    # Step 3: Apply deterministic business rules
     rule_results = run_rule_engine(
         df,
         policy_limit=policy_limit,
         risk_threshold=risk_threshold
+    )
+
+    # Create a fast lookup dictionary instead of
+    # repeatedly searching the complete DataFrame.
+    rule_lookup = (
+        rule_results
+        .set_index("invoice_id")
+        .to_dict(orient="index")
     )
 
     results = []
@@ -43,17 +51,10 @@ def process_file(
 
         invoice_id = row.get("invoice_id")
 
-        invoice_rule_result = {}
-
-        if not rule_results.empty:
-            matching_rules = rule_results[
-                rule_results["invoice_id"] == invoice_id
-            ]
-
-            if not matching_rules.empty:
-                invoice_rule_result = (
-                    matching_rules.iloc[0].to_dict()
-                )
+        invoice_rule_result = rule_lookup.get(
+            invoice_id,
+            {}
+        )
 
         results.append({
             "invoice_id": invoice_id,
