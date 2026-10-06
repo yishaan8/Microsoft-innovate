@@ -1,0 +1,29 @@
+{
+  "new_ap_tests": {
+    "passed": 56
+  },
+  "full_non_integration_tests": {
+    "passed": 382,
+    "skipped": 10,
+    "deselected": 6,
+    "duration_seconds": 74.17
+  },
+  "python_lint": "Passed: invoice API, policy, store and AP tests",
+  "frontend_build": "Passed",
+  "frontend_lint": "Exit 0; two inherited warnings, zero new warnings",
+  "api_startup_restart": "Passed with real FastAPI app and existing AuditStore engine; analysis, ledger, finalization, static frontend HTTP 200 and restart persistence",
+  "browser": "Earlier populated dashboard/duplicate UI verified with captured real API results. New review/audit UI builds and passes lint; live browser-to-Python transport remains unverified.",
+  "scope": "Existing MerchantShield SQLite engine reused. Three additive AP evidence/window/event tables. Partner authentication and final reviewer decisions untouched. No AP supervised model training or new AP accuracy benchmark.",
+  "million_volume": "Budget arithmetic tested at one and two million. Scoring requests remain limited to 500 invoices; million-row throughput not load-tested.",
+  "cascade": "70/30 measured target; all unresolved cases retained. Default review and monitoring allocations each 100 per million distinct invoices per finalized window; small populations round upward.",
+  "latest_update": {
+    "frontend": "Helvetica; Framer Motion page/card/dialog/toast transitions; reduced motion supported",
+    "population": "Latest saved window, SQL database-wide totals, paginated invoice records",
+    "imports": "5,000 rows / 20 MB per file, bounded 500-row batches",
+    "new_AP_tests": 59,
+    "frontend_build": "Passed",
+    "frontend_lint": "Two inherited warnings; zero new warnings",
+    "python_lint": "Passed",
+    "note": "382 full-suite tests passed before this update; current changes verified with focused AP tests and population smoke. Million-row throughput untested."
+  }
+}

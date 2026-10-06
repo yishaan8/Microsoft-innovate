@@ -9,3 +9,13 @@ data/raw/
 
 # Generated processed datasets
 data/processed/
+
+# Local environments, dependencies and runtime databases
+.venv/
+node_modules/
+.ruff_cache/
+.DS_Store
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
