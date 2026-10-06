@@ -1,0 +1,1700 @@
+--- original/backend/main.py
++++ updated/backend/main.py
+@@ -23,7 +23,9 @@
+ from backend.config import settings
+ from backend.services.model_loader import load_model_bundle, ModelUnavailableError
+ from backend.services.audit_service import AuditStore
++from backend.services.invoice_audit import InvoiceAuditStore
+ from backend.api.routes import router
++from backend.invoices import router as invoice_router
+ from backend.commerce import CommerceStore, router as commerce_router
+ from backend.reviews import initialize_reviews, load_review_model, router as reviews_router
+ 
+@@ -61,6 +63,12 @@
+         logger.error(f"AUDIT STORE FAILED TO INITIALIZE: {e}")
+         app.state.audit_store = None
+ 
++    try:
++        app.state.invoice_audit_store = InvoiceAuditStore(app.state.audit_store) if app.state.audit_store else None
++    except Exception:
++        logger.exception("Invoice audit tables failed to initialize")
++        app.state.invoice_audit_store = None
++
+     yield
+ 
+     # no special teardown needed for sqlite/joblib-loaded objects
+@@ -74,6 +82,7 @@
+ )
+ 
+ app.include_router(router)
++app.include_router(invoice_router)
+ app.include_router(commerce_router)
+ app.include_router(reviews_router)
+ 
+--- original/backend/invoices.py
++++ updated/backend/invoices.py
+@@ -0,0 +1,344 @@
++"""AP cascade; pure analysis plus evidence persistence in the existing audit DB."""
++
++import csv
++import io
++import math
++import re
++import statistics
++import unicodedata
++from datetime import date
++from difflib import SequenceMatcher
++from typing import Literal
++
++import numpy as np
++from fastapi import APIRouter, HTTPException, Query, Request
++from pydantic import (
++    BaseModel,
++    ConfigDict,
++    Field,
++    ValidationError,
++    field_validator,
++    model_validator,
++)
++from sklearn.ensemble import IsolationForest
++from sklearn.feature_extraction.text import TfidfVectorizer
++
++from backend.invoice_priority import ReviewPolicy, allocate, priority_evidence
++
++router = APIRouter(prefix="/ap", tags=["accounts-payable"])
++
++
++def normalize(value: str) -> str:
++    return re.sub(r"[\W_]+", "", unicodedata.normalize("NFKC", value).casefold())
++
++
++class Invoice(BaseModel):
++    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True, allow_inf_nan=False)
++
++    id: str = Field(min_length=1, max_length=64)
++    invoice_number: str = Field(min_length=1, max_length=100)
++    supplier: str = Field(min_length=1, max_length=160)
++    supplier_id: str | None = Field(default=None, min_length=1, max_length=100)
++    department: str = Field(min_length=1, max_length=100)
++    amount: float = Field(gt=0, le=100_000_000)
++    currency: Literal["INR", "USD", "EUR", "ZAR"] = "INR"
++    date: date
++    description: str = Field(min_length=1, max_length=1000)
++    po_number: str = Field(default="", max_length=100)
++    tax_id: str = Field(default="", max_length=100)
++
++    @field_validator("id", "invoice_number", "supplier", "department", "description", "supplier_id")
++    @classmethod
++    def nonblank(cls, value):
++        if value is not None and not normalize(value):
++            raise ValueError("must contain letters or numbers")
++        return value
++
++    @field_validator("amount", mode="before")
++    @classmethod
++    def amount_not_boolean(cls, value):
++        if isinstance(value, bool):
++            raise ValueError("amount must be numeric, not boolean")  # noqa: TRY004 -- Pydantic validation
++        return value
++
++
++class AnalysisRequest(BaseModel):
++    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
++    invoices: list[Invoice] = Field(min_length=1, max_length=500)
++    history: list[Invoice] = Field(default_factory=list, max_length=2000)
++    department_limits: dict[str, float] = Field(default_factory=dict, max_length=100)
++    watchlist_tax_ids: list[str] = Field(default_factory=list, max_length=1000)
++    review_policy: ReviewPolicy = Field(default_factory=ReviewPolicy)
++    window_id: str = Field(default="default", min_length=1, max_length=64, pattern=r"^[a-zA-Z0-9_-]+$")
++
++    @model_validator(mode="after")
++    def validate_context(self):
++        ids = [item.id for item in self.invoices + self.history]
++        if len(ids) != len(set(ids)):
++            raise ValueError("internal invoice IDs must be unique across invoices and history")
++        if any(not key.strip() or not math.isfinite(value) or value <= 0
++               for key, value in self.department_limits.items()):
++            raise ValueError("department limits must have nonblank names and finite positive amounts")
++        return self
++
++
++def same_supplier(a: Invoice, b: Invoice) -> bool:
++    if a.supplier_id and b.supplier_id:
++        return a.supplier_id == b.supplier_id
++    return SequenceMatcher(None, normalize(a.supplier), normalize(b.supplier)).ratio() >= 0.88
++
++
++def description_similarity(a: str, b: str) -> float:
++    if normalize(a) == normalize(b):
++        return 1.0
++    try:
++        vectors = TfidfVectorizer(strip_accents="unicode", ngram_range=(1, 2)).fit_transform([a, b])
++        return float((vectors[0] @ vectors[1].T).toarray()[0, 0])
++    except ValueError:  # Single-character-only descriptions have no TF-IDF vocabulary.
++        return SequenceMatcher(None, normalize(a), normalize(b)).ratio()
++
++
++def match_invoice(invoice: Invoice, candidates: list[Invoice]) -> dict | None:
++    """Block by supplier, currency, date and amount before expensive text comparison."""
++    best = None
++    for other in candidates:
++        if (other.date > invoice.date or other.currency != invoice.currency
++                or not same_supplier(invoice, other)):
++            continue
++        days = (invoice.date - other.date).days
++        amount_gap = abs(invoice.amount - other.amount) / max(invoice.amount, other.amount)
++        number = SequenceMatcher(None, normalize(invoice.invoice_number), normalize(other.invoice_number)).ratio()
++        exact_number = normalize(invoice.invoice_number) == normalize(other.invoice_number)
++        # A repeated supplier invoice number is worth checking even if the amount changed.
++        if not exact_number and (days > 14 or amount_gap > 0.02):
++            continue
++        description = description_similarity(invoice.description, other.description)
++        exact = exact_number and abs(invoice.amount - other.amount) < 0.005
++        similarity = 0.35 * number + 0.35 * description + 0.2 * (1 - amount_gap) + 0.1 * max(0, 1 - days / 14)
++        if not (exact_number or (similarity >= 0.78 and description >= 0.55 and number >= 0.65)):
++            continue
++        result = {
++            "kind": "EXACT_DUPLICATE" if exact else "NEAR_DUPLICATE",
++            "similarity": round(similarity, 4),
++            "matched_invoice": other.model_dump(mode="json"),
++            "components": {"invoice_number": round(number, 4), "description_tfidf": round(description, 4),
++                           "amount_difference_pct": round(amount_gap * 100, 3), "date_gap_days": days},
++            "reason": "Supplier and normalized invoice number repeat." if exact_number
++                      else "Supplier, amount, invoice number and description are similar within 14 days.",
++        }
++        rank = (exact, exact_number, similarity)
++        if best is None or rank > best[0]:
++            best = (rank, result)
++    return best[1] if best else None
++
++
++def anomaly_evidence(invoice: Invoice, history: list[Invoice], run_model: bool = True) -> dict:
++    prior = [row.amount for row in history if row.date < invoice.date
++             and row.currency == invoice.currency and same_supplier(invoice, row)]
++    result = {"prior_count": len(prior), "method": "insufficient_history", "score": 0,
++              "median_amount": None, "amount_ratio": None, "isolation_outlier": None}
++    if len(prior) < 5:
++        return result
++    median = statistics.median(prior)
++    mad = statistics.median(abs(value - median) for value in prior)
++    # A floor avoids treating tiny variations in a constant history as extreme.
++    robust_z = abs(invoice.amount - median) / max(1.4826 * mad, median * 0.1, 1)
++    score = min(75, round(max(0, robust_z - 3) * 12))
++    result.update(method="historical_median_mad", median_amount=round(median, 2),
++                  amount_ratio=round(invoice.amount / median, 3), robust_z=round(robust_z, 3), score=score)
++    if run_model and len(prior) >= 20:
++        detector = IsolationForest(n_estimators=50, random_state=42, contamination="auto", n_jobs=1)
++        detector.fit(np.log1p(prior).reshape(-1, 1))
++        value = [[math.log1p(invoice.amount)]]
++        result.update(method="historical_median_mad+isolation_forest",
++                      isolation_outlier=bool(detector.predict(value)[0] == -1),
++                      isolation_decision=round(float(detector.decision_function(value)[0]), 4))
++    return result
++
++
++def recurring_description_evidence(invoice: Invoice, history: list[Invoice]) -> dict:
++    best = {"similarity": 0.0, "reference_id": None, "threshold": 0.7}
++    seen = set()
++    for row in history:
++        if row.date >= invoice.date or row.currency != invoice.currency or not same_supplier(invoice, row):
++            continue
++        description = normalize(row.description)
++        if description in seen:
++            continue
++        seen.add(description)
++        similarity = description_similarity(invoice.description, row.description)
++        if similarity > best["similarity"]:
++            best.update(similarity=round(similarity, 4), reference_id=row.id)
++        if similarity == 1:
++            break
++    return best
++
++
++def analyze(payload: AnalysisRequest) -> dict:
++    results = []
++    candidates = list(payload.history)
++    watchlist = {normalize(value) for value in payload.watchlist_tax_ids if normalize(value)}
++    for invoice in sorted(payload.invoices, key=lambda row: row.date):
++        signals = []
++        if not invoice.po_number.strip():
++            signals.append({"code": "MISSING_PO", "severity": "MEDIUM", "score": 45,
++                            "reason": "No purchase order reference was supplied."})
++        if not invoice.tax_id.strip():
++            signals.append({"code": "MISSING_TAX_ID", "severity": "MEDIUM", "score": 45,
++                            "reason": "No supplier tax identifier was supplied."})
++        if normalize(invoice.tax_id) in watchlist:
++            signals.append({"code": "WATCHLIST_MATCH", "severity": "CRITICAL", "score": 100,
++                            "reason": "Tax ID matches the watchlist supplied by the caller; verify the source."})
++        limit = payload.department_limits.get(invoice.department)
++        if limit and invoice.currency == "INR" and invoice.amount > limit:
++            signals.append({"code": "DEPARTMENT_LIMIT", "severity": "HIGH", "score": 80,
++                            "reason": f"Amount {invoice.amount:,.2f} INR exceeds {invoice.department} limit {limit:,.2f} INR."})
++        match = match_invoice(invoice, candidates)
++        if match:
++            signals.append({"code": match["kind"], "severity": "HIGH", "score": 90,
++                            "reason": f"Potential duplicate of {match['matched_invoice']['invoice_number']}. {match['reason']}"})
++        # Cheap matching/rules/baseline first. Only unresolved cases fit the ML model.
++        anomaly = anomaly_evidence(invoice, candidates, run_model=False)
++        recurring = recurring_description_evidence(invoice, candidates) if not signals else None
++        if signals:
++            route, route_reason = "RULE_FLAGGED", "Rule or duplicate evidence already identifies an exception; ML skipped."
++        elif anomaly["prior_count"] >= 5 and anomaly.get("robust_z", 0) <= 3 and recurring["similarity"] >= recurring["threshold"]:
++            route, route_reason = "BASELINE_CLEAR", "No rule/duplicate finding; stable amount and description similar to strictly earlier supplier history."
++        else:
++            route, route_reason = "ML_REQUIRED", "Insufficient baseline or atypical amount requires the second-stage check."
++            anomaly = anomaly_evidence(invoice, candidates, run_model=True)
++            if anomaly["prior_count"] < 20:
++                signals.append({"code": "INSUFFICIENT_HISTORY", "severity": "MEDIUM", "score": 35,
++                                "reason": "Fewer than 20 strictly earlier supplier records; Isolation Forest could not run. Obtain history; do not treat as verified."})
++        if anomaly["score"] >= 40:
++            signals.append({"code": "AMOUNT_ANOMALY", "severity": "HIGH", "score": anomaly["score"],
++                            "reason": f"Amount is {anomaly['amount_ratio']:.2f} times the strictly earlier supplier median."})
++        elif anomaly["isolation_outlier"]:
++            signals.append({"code": "ML_AMOUNT_OUTLIER", "severity": "HIGH", "score": 65,
++                            "reason": "Second-stage Isolation Forest classifies the amount as atypical against strictly earlier supplier records."})
++        score = max((item["score"] for item in signals), default=anomaly["score"])
++        severity = "CRITICAL" if score >= 95 else "HIGH" if score >= 65 else "MEDIUM" if score >= 35 else "LOW"
++        results.append({"invoice": invoice.model_dump(mode="json"), "signals": signals,
++                        "match": match, "anomaly": anomaly, "risk_score": score, "severity": severity,
++                        "status": "FLAGGED" if signals else "CLEARED",
++                        "review_required": bool(signals), "score_type": "triage_score_not_probability",
++                        "pipeline": {"route": route, "reason": route_reason,
++                                     "recurring_description": recurring,
++                                     "ml_executed": anomaly["isolation_outlier"] is not None},
++                        "audit": {"policy_version": "ap-cascade-v2", "checks": ["schema", "rules", "exact_fuzzy_match", "prior_amount_baseline"],
++                                  "findings": [signal["reason"] for signal in signals],
++                                  "conclusion": "Potential exception; requires verification." if signals else "No configured exception found; not proof of legitimacy."}})
++        results[-1]["priority"] = priority_evidence(results[-1], payload.review_policy)
++        candidates.append(invoice)
++    queue = allocate(results, payload.review_policy)
++    routed = sum(row["pipeline"]["route"] == "ML_REQUIRED" for row in results)
++    return {"items": results, "queue": queue, "window_id": payload.window_id,
++            "cascade": {"total": len(results), "rule_flagged": sum(row["pipeline"]["route"] == "RULE_FLAGGED" for row in results),
++                        "baseline_clear": sum(row["pipeline"]["route"] == "BASELINE_CLEAR" for row in results),
++                        "ml_routed": routed, "ml_executed": sum(row["pipeline"]["ml_executed"] for row in results),
++                        "ml_fraction": routed / len(results), "target_ml_fraction": 0.3,
++                        "target_note": "Measured target, not a forced quota. Unresolved cases are never discarded to meet 30%."},
++            "summary": {"invoices": len(results),
++            "flagged": sum(item["review_required"] for item in results),
++            "duplicates": sum(item["match"] is not None for item in results),
++            "critical": sum(item["severity"] == "CRITICAL" for item in results)},
++            "methodology": "Rules/fuzzy matching → robust baseline gate → unresolved ML → exposure/cost priority. All findings retained.",
++            "model_scope": "Invoice triage is separate from MerchantShield's trained transaction HGB/LightGBM models."}
++
++
++@router.post("/analyze")
++def analyze_invoices(payload: AnalysisRequest, request: Request):
++    return persist_analysis(payload, analyze(payload), request)
++
++
++def persist_analysis(payload: AnalysisRequest, result: dict, request: Request) -> dict:
++    store = getattr(request.app.state, "invoice_audit_store", None)
++    if store is None:
++        # Pure router is also usable in unit tests; a real application must initialize the store.
++        result.update(audit_persisted=False, audit_warning="Invoice audit database unavailable; this result is not saved.")
++        return result
++    try:
++        return store.record(payload, result)
++    except ValueError as exc:
++        raise HTTPException(status_code=409, detail=str(exc)) from exc
++    except Exception as exc:
++        raise HTTPException(status_code=503, detail="Could not save complete invoice evidence; retry after restoring the audit database.") from exc
++
++
++@router.get("/audit")
++def invoice_audit(request: Request, window_id: str = Query(default="default", pattern=r"^[a-zA-Z0-9_-]{1,64}$"),
++                  limit: int = Query(default=100, ge=1, le=500), offset: int = Query(default=0, ge=0),
++                  tier: Literal["ALL", "REVIEW_NOW", "MONITOR", "DEFERRED", "NO_REVIEW", "ALLOCATED"] = "ALL"):
++    store = getattr(request.app.state, "invoice_audit_store", None)
++    if store is None:
++        raise HTTPException(status_code=503, detail="Invoice audit database unavailable.")
++    return store.get_recent(window_id, limit, offset, tier)
++
++
++@router.post("/windows/{window_id}/finalize")
++def finalize_window(window_id: str, request: Request):
++    store = getattr(request.app.state, "invoice_audit_store", None)
++    if store is None:
++        raise HTTPException(status_code=503, detail="Invoice audit database unavailable.")
++    try:
++        return store.finalize(window_id)
++    except ValueError as exc:
++        raise HTTPException(status_code=409, detail=str(exc)) from exc
++
++
++class CsvImport(BaseModel):
++    model_config = ConfigDict(extra="forbid")
++    csv_text: str = Field(min_length=1, max_length=2_000_000)
++
++
++@router.post("/import")
++def import_csv(payload: CsvImport, request: Request):
++    try:
++        reader = csv.DictReader(io.StringIO(payload.csv_text.lstrip("\ufeff")), strict=True)
++        fields = reader.fieldnames or []
++        if len(fields) != len(set(fields)) or set(fields) - Invoice.model_fields.keys():
++            raise ValueError("CSV contains duplicate or unknown columns")
++        rows = []
++        for row in reader:
++            if len(rows) >= 500:
++                raise ValueError("Import is limited to 500 invoices")
++            if None in row or any(value is None for value in row.values()):
++                raise ValueError("CSV row width does not match its header")
++            rows.append(Invoice.model_validate({key: value for key, value in row.items()
++                                               if value != "" or key in {"po_number", "tax_id"}}))
++        analysis_input = AnalysisRequest(invoices=rows)
++        return {"input": analysis_input.model_dump(mode="json"), "analysis": persist_analysis(analysis_input, analyze(analysis_input), request)}
++    except (ValueError, csv.Error, ValidationError) as exc:
++        raise HTTPException(status_code=422, detail=f"Invalid invoice CSV: {exc}") from exc
++
++
++@router.get("/demo")
++def demo_invoices():
++    """Fictional invoice fixtures, deliberately distinct from the MerchantShield dataset."""
++    suppliers = [("zenith", "Zenith Global Logistics Ltd", "Supply Chain", 845000),
++                 ("acme", "Acme Cyber Solutions", "IT & Cloud", 1420000),
++                 ("delta", "Delta Industrial Supplies", "Manufacturing", 320000),
++                 ("azure", "Azure Cloud Reseller India", "IT & Cloud", 28500),
++                 ("nexus", "Nexus Creative & Media Agency", "Marketing", 4950000),
++                 ("apex", "Apex Facilities & Workplace Mgmt", "Operations", 185000)]
++    invoices, history = [], []
++    for index, (sid, supplier, department, amount) in enumerate(suppliers):
++        item = {"id": f"demo-{index}", "invoice_number": f"INV-2026-{8801 + index}",
++                "supplier_id": sid, "supplier": supplier, "department": department, "amount": amount,
++                "date": "2026-10-03", "description": "Monthly contracted services and delivery",
++                "po_number": f"PO-{2020 + index}", "tax_id": f"DEMO-TAX-{index}", "currency": "INR"}
++        if sid == "zenith":
++            item["description"] = "Freight delivery and handling surcharge"
++        if sid == "delta":
++            item["description"] = "Industrial steel supplies warehouse delivery"
++            history.append({**item, "id": "delta-reference", "invoice_number": "INV-2026-8803A",
++                            "date": "2026-10-01", "amount": 319500})
++        if sid == "azure":
++            item["tax_id"] = ""
++        invoices.append(item)
++        for day in range(1, 26):
++            history.append({**item, "id": f"history-{sid}-{day}", "invoice_number": f"PAID-{sid}-{day}",
++                            "date": f"2026-09-{day:02d}", "amount": (amount / 8 if sid == "zenith" else amount) * (0.96 + day % 5 * .02)})
++    return {"invoices": invoices, "history": history,
++            "department_limits": {"Marketing": 2500000}, "watchlist_tax_ids": ["DEMO-TAX-1"],
++            "provenance": "Fictional AP demonstration; not MerchantShield training or benchmark data."}
+--- original/backend/invoice_priority.py
++++ updated/backend/invoice_priority.py
+@@ -0,0 +1,67 @@
++"""Explicit invoice review policy. Signal strength is not a fraud probability."""
++
++import math
++
++from pydantic import BaseModel, ConfigDict, Field, field_validator
++
++
++class ReviewPolicy(BaseModel):
++    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
++    reviews_per_million: int = Field(default=100, ge=0, le=10000, strict=True)
++    monitors_per_million: int = Field(default=100, ge=0, le=10000, strict=True)
++    review_cost_inr: float = Field(default=100, gt=0)
++    recovery_fraction: float = Field(default=0.5, ge=0, le=1)
++    currency_to_inr: dict[str, float] = Field(default_factory=lambda: {"INR": 1.0})
++
++    @field_validator("currency_to_inr")
++    @classmethod
++    def valid_rates(cls, rates):
++        if any(key not in {"INR", "USD", "EUR", "ZAR"} or not math.isfinite(value) or value <= 0
++               for key, value in rates.items()):
++            raise ValueError("Supply finite positive INR conversion rates for supported currencies")
++        return rates
++
++
++def capacities(population: int, policy: ReviewPolicy) -> tuple[int, int]:
++    # Round upward for tiny demos; aggregate the population before applying this.
++    return (math.ceil(population * policy.reviews_per_million / 1_000_000),
++            math.ceil(population * policy.monitors_per_million / 1_000_000))
++
++
++def priority_evidence(item: dict, policy: ReviewPolicy) -> dict:
++    invoice = item["invoice"]
++    rate = policy.currency_to_inr.get(invoice["currency"])
++    exposure = invoice["amount"] * rate if rate is not None else None
++    strength = item["risk_score"] / 100
++    priority = exposure * strength * policy.recovery_fraction / policy.review_cost_inr if exposure is not None else None
++    return {"index": round(priority, 6) if priority is not None else None,
++            "formula": "amount_inr × signal_strength × recovery_fraction / review_cost_inr",
++            "amount_inr": exposure, "signal_strength": strength,
++            "recovery_fraction": policy.recovery_fraction, "review_cost_inr": policy.review_cost_inr,
++            "currency_rate": rate, "critical_first": item["severity"] == "CRITICAL",
++            "warning": "Missing caller-supplied currency rate; monetary priority unavailable." if rate is None else None,
++            "interpretation": "Exposure-weighted triage index, not expected loss or calibrated fraud probability."}
++
++
++def allocate(items: list[dict], policy: ReviewPolicy) -> dict:
++    review_capacity, monitor_capacity = capacities(len(items), policy)
++    flagged = [item for item in items if item["review_required"]]
++    ranked = sorted(flagged, key=lambda row: (-int(row["severity"] == "CRITICAL"),
++                    -(row["priority"]["index"] or 0), -row["risk_score"], row["invoice"]["id"]))
++    review_ids = {row["invoice"]["id"] for row in ranked[:review_capacity]}
++    remaining = [row for row in ranked if row["invoice"]["id"] not in review_ids]
++    # Medium cases are monitored before other overflow; monitoring is not a human task.
++    remaining.sort(key=lambda row: (row["severity"] != "MEDIUM", -(row["priority"]["index"] or 0), row["invoice"]["id"]))
++    monitor_ids = {row["invoice"]["id"] for row in remaining[:monitor_capacity]}
++    for rank, row in enumerate(ranked, 1):
++        ident = row["invoice"]["id"]
++        row["queue"] = {"tier": "REVIEW_NOW" if ident in review_ids else "MONITOR" if ident in monitor_ids else "DEFERRED",
++                        "rank": rank, "reason": "Priority allocation under the population review budget. All evidence retained."}
++    for row in items:
++        if not row["review_required"]:
++            row["queue"] = {"tier": "NO_REVIEW", "rank": None, "reason": "No configured exception detected; not proof of legitimacy."}
++    return {"population": len(items), "flagged": len(flagged), "review_capacity": review_capacity,
++            "monitor_capacity": monitor_capacity, "review_now": len(review_ids), "monitor": len(monitor_ids),
++            "deferred": len(flagged) - len(review_ids) - len(monitor_ids),
++            "critical_overflow": sum(row["severity"] == "CRITICAL" and row["invoice"]["id"] not in review_ids for row in ranked),
++            "policy": policy.model_dump(), "rounding": "Ceiling after aggregation; small populations exceed the nominal per-million rate."}
+--- original/backend/services/invoice_audit.py
++++ updated/backend/services/invoice_audit.py
+@@ -0,0 +1,153 @@
++"""Invoice evidence and shared-window budgets on MerchantShield's existing engine."""
++
++import hashlib
++import json
++from datetime import datetime, timezone
++
++from sqlalchemy import (
++    Column,
++    Float,
++    Integer,
++    MetaData,
++    String,
++    Table,
++    Text,
++    func,
++    select,
++)
++from sqlalchemy.dialects.sqlite import insert
++
++from backend.invoice_priority import ReviewPolicy, capacities
++
++metadata = MetaData()
++windows = Table("ap_review_windows", metadata,
++                Column("id", String(64), primary_key=True), Column("policy_json", Text, nullable=False),
++                Column("finalized", Integer, nullable=False, default=0))
++invoices = Table("ap_invoice_evidence", metadata,
++                 Column("window_id", String(64), primary_key=True), Column("invoice_id", String(64), primary_key=True),
++                 Column("flagged", Integer, nullable=False, index=True), Column("critical", Integer, nullable=False),
++                 Column("medium", Integer, nullable=False), Column("priority", Float, nullable=False),
++                 Column("score", Integer, nullable=False), Column("tier", String(24), nullable=False),
++                 Column("rank", Integer), Column("evidence_json", Text, nullable=False), Column("updated_at", String(64), nullable=False))
++batches = Table("ap_analysis_events", metadata,
++                Column("id", String(64), primary_key=True), Column("window_id", String(64), nullable=False, index=True),
++                Column("input_json", Text, nullable=False), Column("result_json", Text, nullable=False),
++                Column("created_at", String(64), nullable=False))
++
++
++def canonical(value):
++    return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
++
++
++class InvoiceAuditStore:
++    def __init__(self, audit_store):
++        # Reuse the existing connection, path and transaction database; no second DB.
++        self.engine = audit_store.engine
++        metadata.create_all(self.engine)
++
++    def _allocate(self, connection, window_id, policy):
++        scope = invoices.c.window_id == window_id
++        population = connection.scalar(select(func.count()).select_from(invoices).where(scope))
++        flagged = connection.scalar(select(func.count()).select_from(invoices).where(scope, invoices.c.flagged == 1))
++        review_capacity, monitor_capacity = capacities(population, policy)
++        ranking = select(invoices.c.invoice_id, invoices.c.critical).where(scope, invoices.c.flagged == 1)
++        review = connection.execute(ranking.order_by(invoices.c.critical.desc(), invoices.c.priority.desc(),
++                                    invoices.c.score.desc(), invoices.c.invoice_id).limit(review_capacity)).all()
++        review_ids = [row.invoice_id for row in review]
++        monitor_query = ranking.where(invoices.c.invoice_id.not_in(review_ids)) if review_ids else ranking
++        monitor = connection.execute(monitor_query.order_by(invoices.c.medium.desc(), invoices.c.priority.desc(),
++                                     invoices.c.invoice_id).limit(monitor_capacity)).all()
++        connection.execute(invoices.update().where(scope).values(tier="NO_REVIEW", rank=None))
++        connection.execute(invoices.update().where(scope, invoices.c.flagged == 1).values(tier="DEFERRED"))
++        for tier, rows in [("REVIEW_NOW", review), ("MONITOR", monitor)]:
++            for rank, row in enumerate(rows, 1):
++                connection.execute(invoices.update().where(scope, invoices.c.invoice_id == row.invoice_id).values(tier=tier, rank=rank))
++        critical = connection.scalar(select(func.count()).select_from(invoices).where(scope, invoices.c.critical == 1))
++        return {"population": population, "flagged": flagged, "review_capacity": review_capacity,
++                "monitor_capacity": monitor_capacity, "review_now": len(review), "monitor": len(monitor),
++                "deferred": flagged - len(review) - len(monitor),
++                "critical_overflow": critical - sum(row.critical for row in review),
++                "policy": policy.model_dump(), "scope": f"shared database window: {window_id}",
++                "rounding": "Ceiling after aggregation. At one million: 100 reviews + 100 monitors. Small windows round up."}
++
++    @staticmethod
++    def _decode(row):
++        item = json.loads(row.evidence_json)
++        item["queue"] = {"tier": row.tier, "rank": row.rank,
++                         "reason": "Shared-window budget; rank is within the allocated tier. Deferred flags remain stored."}
++        item["audit"].update(saved_at=row.updated_at, persisted=True)
++        return item
++
++    def record(self, payload, result):
++        window_id = payload.window_id
++        input_json = canonical(payload.model_dump(mode="json"))
++        event_id = hashlib.sha256(input_json.encode()).hexdigest()
++        policy_json = canonical(payload.review_policy.model_dump())
++        now = datetime.now(timezone.utc).isoformat()
++        with self.engine.connect() as connection:
++            # Serialize window allocations across concurrent SQLite uploads.
++            connection.exec_driver_sql("BEGIN IMMEDIATE")
++            try:
++                existing_policy = connection.scalar(select(windows.c.policy_json).where(windows.c.id == window_id))
++                if existing_policy is not None and existing_policy != policy_json:
++                    raise ValueError("Review policy differs from this existing window. Use the agreed policy or a new window_id.")
++                connection.execute(insert(windows).values(id=window_id, policy_json=policy_json).on_conflict_do_nothing())
++                seen = connection.scalar(select(batches.c.id).where(batches.c.id == event_id))
++                finalized = bool(connection.scalar(select(windows.c.finalized).where(windows.c.id == window_id)))
++                if finalized and not seen:
++                    raise ValueError("This window is finalized. Intake is frozen to protect its review budget; use a new window_id for new invoices.")
++                if not seen:
++                    for item in result["items"]:
++                        values = {"window_id": window_id, "invoice_id": item["invoice"]["id"],
++                                  "flagged": int(item["review_required"]), "critical": int(item["severity"] == "CRITICAL"),
++                                  "medium": int(item["severity"] == "MEDIUM"), "priority": item["priority"]["index"] or 0,
++                                  "score": item["risk_score"], "tier": item["queue"]["tier"], "rank": None,
++                                  "evidence_json": canonical(item), "updated_at": now}
++                        statement = insert(invoices).values(**values)
++                        connection.execute(statement.on_conflict_do_update(index_elements=["window_id", "invoice_id"], set_=values))
++                result["queue"] = self._allocate(connection, window_id, payload.review_policy)
++                result["queue"]["finalized"] = finalized
++                ids = [item["invoice"]["id"] for item in result["items"]]
++                saved = {row.invoice_id: self._decode(row) for row in connection.execute(
++                    select(invoices).where(invoices.c.window_id == window_id, invoices.c.invoice_id.in_(ids)))}
++                result["items"] = [saved[item["invoice"]["id"]] for item in result["items"]]
++                result.update(audit_persisted=True, audit_event_id=event_id, idempotent_replay=bool(seen))
++                if not seen:
++                    connection.execute(batches.insert().values(id=event_id, window_id=window_id, input_json=input_json,
++                                       result_json=canonical(result), created_at=now))
++                connection.commit()
++            except Exception:
++                connection.rollback()
++                raise
++        return result
++
++    def get_recent(self, window_id, limit=100, offset=0, tier="ALL"):
++        with self.engine.connect() as connection:
++            scope = invoices.c.window_id == window_id
++            if tier == "ALLOCATED":
++                scope = scope & invoices.c.tier.in_(["REVIEW_NOW", "MONITOR"])
++            elif tier != "ALL":
++                scope = scope & (invoices.c.tier == tier)
++            rows = connection.execute(select(invoices).where(scope).order_by(invoices.c.updated_at.desc(), invoices.c.invoice_id)
++                                      .limit(limit).offset(offset)).all()
++            population = connection.scalar(select(func.count()).select_from(invoices).where(scope))
++            finalized = bool(connection.scalar(select(windows.c.finalized).where(windows.c.id == window_id)))
++            return {"items": [self._decode(row) for row in rows], "population": population,
++                    "offset": offset, "limit": limit, "has_more": offset + len(rows) < population,
++                    "database": "MerchantShield audit.db", "window_id": window_id, "finalized": finalized}
++
++    def finalize(self, window_id):
++        with self.engine.connect() as connection:
++            connection.exec_driver_sql("BEGIN IMMEDIATE")
++            try:
++                policy_json = connection.scalar(select(windows.c.policy_json).where(windows.c.id == window_id))
++                if policy_json is None:
++                    raise ValueError("No analyzed invoices in this window.")
++                queue = self._allocate(connection, window_id, ReviewPolicy.model_validate_json(policy_json))
++                connection.execute(windows.update().where(windows.c.id == window_id).values(finalized=1))
++                queue["finalized"] = True
++                connection.commit()
++                return queue
++            except Exception:
++                connection.rollback()
++                raise
+--- original/frontend/src/FinSight.jsx
++++ updated/frontend/src/FinSight.jsx
+@@ -0,0 +1,375 @@
++import { useCallback, useEffect, useRef, useState } from 'react'
++import { api } from './api/client'
++import TransactionWorkspace from './App'
++import './styles/FinSight.css'
++
++const NAV = [
++  ['dashboard', 'Dashboard', 'grid'], ['invoices', 'Invoice Explorer', 'file'],
++  ['review', 'Priority Review Queue', 'shield'],
++  ['exceptions', 'Exceptions & Rules', 'alert'], ['analytics', 'AP Analytics', 'chart'],
++  ['bi', 'BI Data Studio', 'database'], ['audit', 'Audit Trail', 'history'],
++  ['transactions', 'Transaction Risk & SHAP', 'shield'],
++]
++const LABELS = {
++  MISSING_PO: 'Missing purchase order', MISSING_TAX_ID: 'Missing supplier tax ID',
++  WATCHLIST_MATCH: 'Supplier watchlist match', DEPARTMENT_LIMIT: 'Department authorization cap',
++  EXACT_DUPLICATE: 'Exact duplicate invoice', NEAR_DUPLICATE: 'TF-IDF near-duplicate collision',
++  AMOUNT_ANOMALY: 'Historical amount anomaly',
++  INSUFFICIENT_HISTORY: 'Supplier history needed', ML_AMOUNT_OUTLIER: 'Second-stage ML outlier',
++}
++const TITLES = {
++  dashboard: 'Accounts Payable Surveillance', invoices: 'Accounts Payable Invoices',
++  review: 'Priority Review & Monitoring',
++  exceptions: 'Exceptions & Rule Surveillance Queue', analytics: 'AP Exception Analytics & BI',
++  bi: 'BI Data Studio', audit: 'AP Compliance & Audit Ledger', transactions: 'MerchantShield Transaction Risk',
++}
++const COLORS = ['#111827', '#294acb', '#475569', '#7c8ba5', '#a7b0c0', '#d7dce5']
++const money = (value, currency = 'INR') => new Intl.NumberFormat('en-IN', { style: 'currency', currency, maximumFractionDigits: 0 }).format(value)
++const pct = (value) => `${Math.round(value * 100)}%`
++
++function Icon({ name, size = 18 }) {
++  const shapes = {
++    shield: <><path d="M12 3 3 7v5c0 5 9 9 9 9s9-4 9-9V7z"/><path d="m8 12 3 3 5-6"/></>,
++    grid: <><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></>,
++    file: <path d="M14 3H5v18h14V8zM14 3v5h5M8 12h8M8 16h5"/>,
++    alert: <><path d="m12 3 10 18H2zM12 9v5"/><path d="M12 17h.01"/></>,
++    chart: <path d="M3 3v18h18M7 17v-5M12 17V7M17 17v-8"/>,
++    database: <><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 4 18 4 18 0V5M3 12c0 4 18 4 18 0"/></>,
++    history: <path d="M3 11a9 9 0 1 1 2 7M3 3v8h8M12 7v6l4 2"/>,
++    bot: <><rect x="4" y="7" width="16" height="13" rx="3"/><path d="M12 3v4M8 12h.01M16 12h.01M8 16h8M1 12h3M20 12h3"/></>,
++    upload: <path d="M7 17H5a4 4 0 0 1-1-8 8 8 0 0 1 15-1 5 5 0 0 1 0 10h-2M12 21V11m-4 4 4-4 4 4"/>,
++    search: <><circle cx="10" cy="10" r="7"/><path d="m15 15 6 6"/></>,
++    refresh: <path d="M20 7a9 9 0 0 0-16 0M4 17a9 9 0 0 0 16 0M20 2v5h-5M4 22v-5h5"/>,
++    download: <path d="M12 3v12m-5-5 5 5 5-5M3 16v5h18v-5"/>,
++    close: <path d="m6 6 12 12M6 18 18 6"/>, filter: <path d="M3 4h18l-7 8v6l-4 2v-8z"/>,
++    chevron: <path d="m8 5 7 7-7 7"/>, menu: <path d="M3 6h18M3 12h18M3 18h18"/>,
++  }
++  return <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">{shapes[name] || shapes.file}</svg>
++}
++
++function Brand({ large = false }) {
++  return <div className={`fs-brand ${large ? 'large' : ''}`}>
++    <span className="fs-logo"><Icon name="shield" size={large ? 30 : 23}/></span>
++    <div><strong>FinSight <small>AP AI</small></strong><span>{large ? 'Microsoft Innovate · Enterprise workspace' : 'Exception Intelligence'}</span></div>
++  </div>
++}
++
++function Modal({ children, title, onClose, drawer = false }) {
++  const dialog = useRef(null)
++  useEffect(() => {
++    const node = dialog.current
++    node.showModal()
++    return () => node.close()
++  }, [])
++  return <dialog ref={dialog} className={`fs-dialog ${drawer ? 'drawer' : ''}`} aria-label={title}
++    onCancel={onClose} onClick={(event) => { if (event.target === event.currentTarget) onClose() }}>
++    <div className="fs-dialog-head"><h2>{title}</h2><button className="fs-icon-button" aria-label="Close dialog" onClick={onClose}><Icon name="close"/></button></div>
++    {children}
++  </dialog>
++}
++
++function download(name, value) {
++  const url = URL.createObjectURL(new Blob([JSON.stringify(value, null, 2)], { type: 'application/json' }))
++  const anchor = document.createElement('a')
++  anchor.href = url; anchor.download = name; anchor.click()
++  setTimeout(() => URL.revokeObjectURL(url), 1000)
++}
++
++function Badge({ value }) { return <span className={`fs-badge ${value.toLowerCase()}`}>{value.replaceAll('_', ' ')}</span> }
++
++function InvoiceTable({ items, onOpen, compact = false }) {
++  return <div className="fs-table-scroll"><table className="fs-table">
++    <thead><tr><th>Invoice #</th><th>Supplier</th><th>Amount</th><th>{compact ? 'Triggered rule' : 'Department / Date'}</th><th>Severity</th><th>{compact ? 'Explainability summary (why?)' : 'Status'}</th><th>Action</th></tr></thead>
++    <tbody>{items.map((item) => <tr key={item.invoice.id}>
++      <td><strong className="fs-mono">{item.invoice.invoice_number}</strong><small>{item.invoice.po_number || 'No purchase order'}</small></td>
++      <td><strong>{item.invoice.supplier}</strong><small>{item.invoice.department}</small></td>
++      <td className="fs-amount">{money(item.invoice.amount, item.invoice.currency)}</td>
++      <td>{compact ? LABELS[item.signals[0]?.code] || 'No rule triggered' : <>{item.invoice.department}<small>{item.invoice.date}</small></>}</td>
++      <td><Badge value={item.severity}/><small>{item.queue?.tier?.replaceAll('_', ' ')}</small></td>
++      <td>{compact ? <span className="fs-reason" title={item.signals.map((signal) => signal.reason).join(' ')}>{item.signals[0]?.reason || 'No exceptions detected.'}</span> : <Badge value={item.status}/>}</td>
++      <td><button className="fs-small-button" onClick={() => onOpen(item)}>{compact ? 'Investigate' : 'View'}</button></td>
++    </tr>)}</tbody>
++  </table>{items.length === 0 && <div className="fs-empty">No invoices match these filters.</div>}</div>
++}
++
++function Trend({ items }) {
++  const last = items.map((item) => item.invoice.date).sort().at(-1) || new Date().toISOString().slice(0, 10)
++  const counts = Array.from({ length: 7 }, (_, index) => {
++    const day = new Date(`${last}T12:00:00Z`)
++    day.setUTCDate(day.getUTCDate() - 6 + index)
++    const date = day.toISOString().slice(0, 10)
++    const rows = items.filter((item) => item.invoice.date === date)
++    return { date, total: rows.length, high: rows.filter((item) => item.severity === 'HIGH').length, critical: rows.filter((item) => item.severity === 'CRITICAL').length }
++  })
++  const max = Math.max(4, ...counts.map((day) => day.total))
++  const line = (key) => counts.map((day, index) => `${44 + index * 96},${225 - day[key] / max * 180}`).join(' ')
++  return <div className="fs-trend">
++    <div className="fs-legend"><span><i style={{ background: '#bf1854' }}/>Critical</span><span><i style={{ background: '#111827' }}/>High / duplicates</span><span><i style={{ background: '#8792a3' }}/>All invoices</span><small>7 DAYS</small></div>
++    <svg viewBox="0 0 670 275" role="img" aria-label="Daily invoice and exception counts in the analyzed batch">
++      <defs><linearGradient id="trendFill" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor="#8a93a3" stopOpacity=".26"/><stop offset="100%" stopColor="#8a93a3" stopOpacity=".03"/></linearGradient></defs>
++      {[0, 1, 2, 3, 4].map((tick) => <g key={tick}><line x1="44" y1={225 - tick * 45} x2="620" y2={225 - tick * 45} stroke="#e8ecf2" strokeDasharray="3 4"/><text x="15" y={230 - tick * 45} fill="#8290a2" fontSize="12">{Math.round(max * tick / 4)}</text></g>)}
++      <polygon points={`44,225 ${line('total')} 620,225`} fill="url(#trendFill)"/>
++      <polyline points={line('total')} fill="none" stroke="#8792a3" strokeWidth="2"/>
++      <polyline points={line('high')} fill="none" stroke="#111827" strokeWidth="2.5"/>
++      <polyline points={line('critical')} fill="none" stroke="#bf1854" strokeWidth="2.5"/>
++      {counts.map((day, index) => <g key={day.date}><circle cx={44 + index * 96} cy={225 - day.total / max * 180} r="3" fill="#8792a3"><title>{day.date}: {day.total} invoices, {day.high} high, {day.critical} critical</title></circle><text x={44 + index * 96} y="255" textAnchor="middle" fill="#8290a2" fontSize="12">{day.date.slice(5)}</text></g>)}
++    </svg><p className="fs-chart-note">Current batch only. Hover a point for daily counts.</p>
++  </div>
++}
++
++function DepartmentChart({ items }) {
++  const groups = Object.entries(items.filter((item) => item.review_required).reduce((acc, item) => {
++    const key = item.invoice.department; acc[key] = (acc[key] || 0) + 1; return acc
++  }, {})).sort((a, b) => b[1] - a[1])
++  const total = groups.reduce((sum, group) => sum + group[1], 0)
++  let offset = 0
++  const segments = groups.map((group, index) => { const start = offset; offset += group[1] / total * 100; return `${COLORS[index % COLORS.length]} ${start}% ${offset}%` }).join(',')
++  return <><div className="fs-donut" style={{ background: total ? `conic-gradient(${segments})` : '#e8ecf2' }} role="img" aria-label={`${total} flagged invoices by department`}><div><small>FLAGGED</small><strong>{total}</strong></div></div>
++    <ul className="fs-dept-list">{groups.map(([name, count], index) => <li key={name}><span><i style={{ background: COLORS[index % COLORS.length] }}/>{name}</span><strong>{count} <small>({pct(count / total)})</small></strong></li>)}</ul>
++    {!total && <p className="fs-empty">No flagged departments.</p>}
++  </>
++}
++
++function RuleChart({ items }) {
++  const groups = Object.entries(items.flatMap((item) => item.signals).reduce((acc, signal) => {
++    acc[signal.code] = (acc[signal.code] || 0) + 1; return acc
++  }, {})).sort((a, b) => b[1] - a[1])
++  const max = Math.max(1, ...groups.map((group) => group[1]))
++  return <div className="fs-rule-chart">{groups.map(([rule, count]) => <div key={rule}><span>{LABELS[rule]}</span><div><i style={{ width: `${count / max * 100}%` }}/></div><strong>{count}</strong></div>)}
++    {!groups.length && <p className="fs-empty">No rule triggers in this batch.</p>}<p className="fs-chart-note">An invoice may trigger more than one rule.</p>
++  </div>
++}
++
++function Panel({ title, subtitle, children, action }) {
++  return <section className="fs-panel"><div className="fs-panel-heading inline"><div><h2>{title}</h2><p>{subtitle}</p></div>{action}</div>{children}</section>
++}
++
++function Investigation({ item, onClose, onHandoff }) {
++  const [note, setNote] = useState('')
++  const invoice = item.invoice
++  const matched = item.match?.matched_invoice
++  const next = matched ? 'Compare original documents, purchase orders and payment status before treating this as duplicate billing.' : item.signals.some((signal) => signal.code === 'WATCHLIST_MATCH') ? 'Verify the supplied watchlist source and supplier identity with Compliance.' : 'Check the purchase order, contracted amount and supplier history with the department owner.'
++  return <Modal title={`Exception Investigation: ${invoice.invoice_number}`} onClose={onClose}>
++    <p className="fs-subtitle">Explainable rule breakdown & review handoff</p>
++    <div className="fs-investigation-banner"><Icon name="alert" size={28}/><div><strong>{invoice.invoice_number} <Badge value={item.severity}/></strong><small>{invoice.supplier} · {invoice.department}</small></div><div className="fs-investigation-amount"><small>INVOICE AMOUNT</small><strong>{money(invoice.amount, invoice.currency)}</strong></div></div>
++    <section className="fs-evidence-section"><h3><span>1</span>What happened?</h3><p>{item.signals.length ? item.signals.map((signal) => signal.reason).join(' ') : 'No review triggers under the supplied policy and history.'}</p></section>
++    <section className="fs-evidence-section warm"><h3><span>2</span>Why did it happen?</h3>
++      <div className="fs-evidence-grid">{item.signals.map((signal) => <article key={signal.code}><strong>{LABELS[signal.code]}</strong><code>{signal.code}</code><p>{signal.reason}</p></article>)}</div>
++      <div className="fs-model-context"><strong>Triage score: {item.risk_score}/100</strong><span>Priority signal; not a fraud probability.</span><span>Prior supplier records: {item.anomaly.prior_count}</span>
++        <span>Pipeline: {item.pipeline?.route} · {item.pipeline?.ml_executed ? 'ML executed' : 'ML skipped'}</span><span>{item.pipeline?.reason}</span>
++        <strong>{item.queue?.tier?.replaceAll('_', ' ')} · Priority index {item.priority?.index ?? 'needs currency rate'}</strong><span>{item.priority?.formula}</span><span>{item.priority?.interpretation}</span>
++        {item.anomaly.median_amount !== null && <span>Historical median: {money(item.anomaly.median_amount, invoice.currency)} · current amount is {item.anomaly.amount_ratio}× median</span>}
++        <span>Method: {item.anomaly.method.replaceAll('_', ' ')}</span>
++        {item.anomaly.isolation_outlier !== null && <span>Isolation Forest: {item.anomaly.isolation_outlier ? 'outside usual historical amount range' : 'within learned historical range'}; decision {item.anomaly.isolation_decision}</span>}
++      </div>
++    </section>
++    {matched && <section className="fs-evidence-section"><h3><span>3</span>Duplicate evidence · {pct(item.match.similarity)} weighted similarity</h3>
++      <div className="fs-comparison">{[invoice, matched].map((record, index) => <article key={record.id}><small>{index === 0 ? 'INCOMING INVOICE' : 'MATCHED REFERENCE'}</small><h4>{record.invoice_number}</h4>
++        <dl><dt>Supplier</dt><dd>{record.supplier}</dd><dt>Amount</dt><dd>{money(record.amount, record.currency)}</dd><dt>Date</dt><dd>{record.date}</dd><dt>Purchase order</dt><dd>{record.po_number || 'Missing'}</dd><dt>Description</dt><dd>{record.description}</dd></dl>
++      </article>)}</div>
++      <div className="fs-match-metrics"><span>Number similarity<strong>{pct(item.match.components.invoice_number)}</strong></span><span>Description TF-IDF<strong>{pct(item.match.components.description_tfidf)}</strong></span><span>Amount difference<strong>{item.match.components.amount_difference_pct}%</strong></span><span>Date gap<strong>{item.match.components.date_gap_days} days</strong></span></div>
++    </section>}
++    <section className="fs-evidence-section blue"><h3><span>{matched ? '4' : '3'}</span>What should I do next?</h3><p>{next}</p>
++      <label className="fs-label">Reviewer note<textarea value={note} onChange={(event) => setNote(event.target.value)} maxLength={2000} placeholder="Evidence for the department owner to verify…"/></label>
++      <p className="fs-chart-note">Download a handoff for your partner’s review system. This screen does not save a decision.</p>
++    </section>
++    <div className="fs-dialog-actions"><button onClick={() => download(`evidence-${invoice.id}.json`, item)}><Icon name="download"/>Export evidence</button>
++      <button className="fs-primary" onClick={() => onHandoff({ invoice_id: invoice.id, disposition: 'PENDING_REVIEW', note, evidence: item, generated_at: new Date().toISOString(), persisted: false })}>Prepare review handoff</button>
++    </div>
++  </Modal>
++}
++
++function Copilot({ items, onClose }) {
++  const [query, setQuery] = useState('')
++  const [messages, setMessages] = useState([{ who: 'assistant', text: 'I can explain the supplied invoice evidence. Ask about an invoice number, duplicate matches, or the review queue. Answers use this analysis; no language model is connected.' }])
++  function ask(text) {
++    if (!text.trim()) return
++    const target = items.find((item) => text.toLowerCase().includes(item.invoice.invoice_number.toLowerCase()))
++    const item = target || (/duplicat|similar/i.test(text) ? items.find((row) => row.match) : null)
++    const answer = item
++      ? `${item.invoice.invoice_number} · ${item.invoice.supplier}: ${item.signals.map((signal) => signal.reason).join(' ') || 'No exceptions detected.'}${item.match ? ` Weighted similarity ${pct(item.match.similarity)}; description TF-IDF ${pct(item.match.components.description_tfidf)}. Similarity is a review signal, not proof of fraud.` : ''}`
++      : `This batch contains ${items.length} invoices, ${items.filter((row) => row.review_required).length} flagged, ${items.filter((row) => row.queue?.tier === 'REVIEW_NOW').length} selected for human review and ${items.filter((row) => row.match).length} potential duplicates. Specify an invoice number to inspect its evidence. I cannot answer beyond the supplied analysis.`
++    setMessages((previous) => [...previous, { who: 'user', text }, { who: 'assistant', text: answer }])
++    setQuery('')
++  }
++  return <Modal title="FinSight AP Copilot" onClose={onClose} drawer>
++    <p className="fs-subtitle">Evidence assistant · deterministic answers</p>
++    <div className="fs-suggestions"><button onClick={() => ask('Explain duplicate matches')}>Explain near-duplicates</button><button onClick={() => ask('Summarize the queue')}>Queue summary</button></div>
++    <div className="fs-messages" aria-live="polite">{messages.map((message, index) => <div key={index} className={message.who}><small>{message.who === 'user' ? 'YOU' : 'FINSIGHT'}</small><p>{message.text}</p></div>)}</div>
++    <form className="fs-chat-form" onSubmit={(event) => { event.preventDefault(); ask(query) }}><input value={query} onChange={(event) => setQuery(event.target.value)} maxLength={500} aria-label="Ask about invoice evidence" placeholder="Ask about an invoice or duplicate…"/><button className="fs-primary" disabled={!query.trim()}>Send</button></form>
++  </Modal>
++}
++
++export default function FinSight() {
++  const [page, setPage] = useState('dashboard')
++  const [role, setRole] = useState('Analyst')
++  const [login, setLogin] = useState(true)
++  const [menu, setMenu] = useState(false)
++  const [analysis, setAnalysis] = useState(null)
++  const [input, setInput] = useState(null)
++  const [provenance, setProvenance] = useState('')
++  const [health, setHealth] = useState(null)
++  const [loading, setLoading] = useState(true)
++  const [error, setError] = useState('')
++  const [search, setSearch] = useState('')
++  const [severity, setSeverity] = useState('ALL')
++  const [status, setStatus] = useState('ALL')
++  const [rule, setRule] = useState('ALL')
++  const [department, setDepartment] = useState('ALL')
++  const [tab, setTab] = useState('overview')
++  const [selected, setSelected] = useState(null)
++  const [upload, setUpload] = useState(false)
++  const [copilot, setCopilot] = useState(false)
++  const [toast, setToast] = useState('')
++  const [audit, setAudit] = useState([])
++  const [auditError, setAuditError] = useState('')
++  const [invoiceLedger, setInvoiceLedger] = useState({ items: [], offset: 0, has_more: false })
++  const windowId = input?.window_id || 'default'
++
++  const loadDemo = useCallback(async () => {
++    try {
++      const { provenance: source, ...payload } = await api.getInvoiceDemo()
++      const result = await api.analyzeInvoices(payload)
++      setInput(payload); setAnalysis(result); setProvenance(source); setError('')
++    } catch (err) { setError(err.message) } finally { setLoading(false) }
++  }, [])
++  // oxlint-disable-next-line react/set-state-in-effect -- Synchronize with external API on mount.
++  useEffect(() => { loadDemo(); api.getHealth().then(setHealth).catch(() => setHealth(null)) }, [loadDemo])
++  useEffect(() => { if (!toast) return; const timer = setTimeout(() => setToast(''), 5000); return () => clearTimeout(timer) }, [toast])
++  const loadAudit = useCallback(async () => {
++    try {
++      const [records, ledger] = await Promise.allSettled([api.getAuditLog(50), api.getInvoiceAudit(windowId, 0, page === 'review' ? 'ALLOCATED' : 'ALL')])
++      if (records.status === 'fulfilled') setAudit(records.value)
++      if (ledger.status === 'fulfilled') setInvoiceLedger(ledger.value)
++      setAuditError([records, ledger].filter((entry) => entry.status === 'rejected').map((entry) => entry.reason.message).join(' '))
++    } catch (err) { setAuditError(err.message) }
++  }, [windowId, page])
++  // oxlint-disable-next-line react/set-state-in-effect -- Load external audit records when the view opens.
++  useEffect(() => { if (['audit', 'review'].includes(page)) loadAudit() }, [page, loadAudit])
++
++  async function refresh() {
++    if (!input) { setLoading(true); return loadDemo() }
++    setLoading(true); setError('')
++    try { setAnalysis(await api.analyzeInvoices(input)); setToast('Analysis refreshed from the current input.') } catch (err) { setError(err.message) } finally { setLoading(false) }
++  }
++  async function importFile(file) {
++    // Review intake must be finalized only after all batches have been imported.
++    if (!file) return
++    if (file.size > 2_000_000) { setError('Choose a CSV or JSON file smaller than 2 MB.'); return }
++    setLoading(true); setError('')
++    try {
++      const text = await file.text()
++      if (file.name.toLowerCase().endsWith('.csv')) {
++        const result = await api.importInvoices(text); setInput(result.input); setAnalysis(result.analysis)
++      } else if (file.name.toLowerCase().endsWith('.json')) {
++        const payload = JSON.parse(text); const result = await api.analyzeInvoices(payload); setInput(payload); setAnalysis(result)
++      } else { throw new Error('Choose a .csv or .json file.') }
++      setProvenance(`Imported file: ${file.name}. Results depend on the supplied history and policy.`)
++      setUpload(false); navigate('invoices'); setToast('Batch analyzed successfully.')
++    } catch (err) { setError(err.message) } finally { setLoading(false) }
++  }
++  async function finalizeQueue() {
++    try {
++      const queue = await api.finalizeInvoiceWindow(input?.window_id || 'default')
++      setAnalysis((current) => ({ ...current, queue })); await loadAudit()
++      setToast('Intake frozen. Queue finalized; new invoices require a new window ID.')
++    } catch (err) { setAuditError(err.message) }
++  }
++  async function changeLedgerPage(offset) {
++    try { setInvoiceLedger(await api.getInvoiceAudit(input?.window_id || 'default', offset, page === 'review' ? 'ALLOCATED' : 'ALL')); setAuditError('') }
++    catch (err) { setAuditError(err.message) }
++  }
++  function navigate(next) {
++    setPage(next); setMenu(false); setSearch(''); setSeverity('ALL'); setStatus('ALL'); setRule('ALL'); setDepartment('ALL')
++  }
++  const items = analysis?.items || []
++  const flagged = items.filter((item) => item.review_required)
++  const visible = items.filter((item) => {
++    const haystack = `${item.invoice.invoice_number} ${item.invoice.supplier} ${item.invoice.department} ${item.signals.map((signal) => `${signal.code} ${signal.reason}`).join(' ')}`.toLowerCase()
++    return haystack.includes(search.toLowerCase()) && (severity === 'ALL' || severity === item.severity)
++      && (status === 'ALL' || status === item.status) && (department === 'ALL' || department === item.invoice.department)
++      && (rule === 'ALL' || item.signals.some((signal) => signal.code === rule))
++  })
++  const exposure = flagged.filter((item) => item.invoice.currency === 'INR').reduce((sum, item) => sum + item.invoice.amount, 0)
++  const registryItems = visible.filter((item) => page !== 'exceptions' || item.review_required)
++
++  if (login) return <div className="fs-login"><div className="fs-login-wrap"><Brand large/><h1>Accounts Payable Exception Intelligence</h1>
++    <div className="fs-login-card"><label className="fs-label">SELECT DEMO ROLE PERSONA</label>
++      <div className="fs-role-options">{['Analyst', 'Admin', 'Auditor'].map((persona) => <button key={persona} className={role === persona ? 'selected' : ''} onClick={() => setRole(persona)}><strong>{persona}</strong><small>{persona === 'Analyst' ? 'Investigations' : persona === 'Admin' ? 'Workspace overview' : 'Compliance'}</small></button>)}</div>
++      <label className="fs-label">Workspace user<input value="Tulsi Tomar" readOnly/></label>
++      <button className="fs-primary fs-enter" onClick={() => setLogin(false)}>Enter demo workspace</button>
++      <div className="fs-login-footer"><Icon name="shield" size={15}/><span>Demo personas · authentication integration pending</span></div>
++    </div></div></div>
++
++  return <div className="finsight">
++    <aside className={`fs-sidebar ${menu ? 'open' : ''}`}><Brand/>
++      <div className="fs-persona"><span className="fs-dot"/><div><strong>Tulsi Tomar</strong><small>ROLE: {role.toUpperCase()} · DEMO</small></div></div>
++      <div className="fs-nav-label">CORE MODULES</div>
++      <nav aria-label="Main navigation">{NAV.map(([key, label, icon]) => <button key={key} className={page === key ? 'active' : ''} onClick={() => navigate(key)} aria-current={page === key ? 'page' : undefined}><Icon name={icon}/><span>{label}</span>{key === 'exceptions' && <small className="fs-active-count">{flagged.length} Active</small>}</button>)}</nav>
++      <div className="fs-nav-label">ASSISTANTS & PIPELINE</div>
++      <nav aria-label="Analysis tools"><button onClick={() => setCopilot(true)}><Icon name="bot"/><span>AP Copilot Assistant</span></button><button onClick={() => setUpload(true)}><Icon name="upload"/><span>Batch Ingestion</span><small>CSV / JSON</small></button></nav>
++      <div className="fs-sidebar-footer"><strong>Team 305</strong><span>Microsoft Innovate 2026 · Bennett University</span><small>Local decision support workspace</small></div>
++    </aside>
++    <div className="fs-main"><header className="fs-topbar">
++      <button className="fs-icon-button fs-mobile-menu" aria-label="Toggle navigation" onClick={() => setMenu(!menu)}><Icon name="menu"/></button>
++      <label className="fs-global-search"><Icon name="search"/><input aria-label="Search invoices, suppliers or rules" placeholder="Search invoices, suppliers, or rules…" value={search} onChange={(event) => { setSearch(event.target.value); if (!['invoices', 'exceptions'].includes(page)) setPage('invoices') }}/></label>
++      <div className="fs-topbar-actions"><button className="fs-dark" onClick={() => setCopilot(true)}><Icon name="bot"/>AP Copilot <small>AI</small></button><button onClick={() => setUpload(true)}><Icon name="upload"/>Batch Upload</button>
++        <span className="fs-api-state"><i className={health?.model_loaded ? 'ready' : ''}/>{health?.model_loaded ? 'API Live' : 'API unavailable'}</span>
++        <label className="fs-role-select"><Icon name="shield" size={14}/><select value={role} onChange={(event) => setRole(event.target.value)} aria-label="Demo persona">{['Analyst', 'Admin', 'Auditor'].map((value) => <option key={value}>{value}</option>)}</select></label>
++        <button className="fs-user" onClick={() => setLogin(true)}><span>TT</span>Tulsi Tomar</button>
++      </div>
++    </header>
++    <main className="fs-content" aria-busy={loading}>
++      <div className="fs-page-heading"><div><h1><Icon name={NAV.find((entry) => entry[0] === page)?.[2] || 'grid'} size={25}/>{TITLES[page]}</h1><p>{page === 'audit' ? 'Complete invoice evidence saved in the existing MerchantShield database.' : 'Invoice validation, matching evidence and bounded human review.'}</p></div>
++        <div className="fs-heading-actions"><button disabled={loading} onClick={['audit', 'review'].includes(page) ? loadAudit : refresh}><Icon name="refresh"/>{loading ? 'Analyzing…' : 'Refresh'}</button><button disabled={!analysis} onClick={() => download(page === 'audit' ? 'finsight-audit-page.json' : 'finsight-analysis.json', page === 'audit' ? invoiceLedger : { ...analysis, provenance })}><Icon name="download"/>Export {page === 'audit' ? 'ledger page' : 'evidence'}</button></div>
++      </div>
++      {error && <div className="fs-error" role="alert">{error}<button onClick={() => setError('')} aria-label="Dismiss error"><Icon name="close" size={16}/></button></div>}
++      {loading && <div className="fs-loading" role="status">Analyzing invoice rules, matches and supplier history…</div>}
++      {analysis?.audit_warning && <div className="fs-error" role="alert">{analysis.audit_warning}</div>}
++      {analysis?.queue?.critical_overflow > 0 && <div className="fs-error" role="alert">{analysis.queue.critical_overflow} critical cases outside the human review budget. Their flags and evidence remain stored; adjust capacity with your team.</div>}
++      {!['transactions', 'audit'].includes(page) && <div className="fs-source"><span className="fs-source-tag">{provenance.startsWith('Imported') ? 'IMPORTED BATCH' : 'SYNTHETIC AP DEMO'}</span><span>{provenance}</span></div>}
++
++      {page === 'dashboard' && <>
++        <div className="fs-kpi-grid">{[[items.length, 'Invoices analyzed', 'Current batch'], [flagged.length, 'Flagged invoices', 'Complete evidence retained'], [analysis?.queue?.review_now || 0, 'Human review tasks', 'Shared window · 100 per million'], [analysis?.queue?.monitor || 0, 'Monitoring cases', 'Separate from human tasks'], [money(exposure), 'Flagged exposure · INR', 'Invoice value, not realized savings']].map(([value, label, context]) => <article className="fs-kpi" key={label}><small>{label}</small><strong>{value}</strong><span>{context}</span></article>)}</div>
++        <Panel title="Detection Funnel & Review Budget" subtitle="Rules and fuzzy matching first · unresolved cases proceed to ML"><p>{analysis?.cascade?.rule_flagged || 0} rule / duplicate findings · {analysis?.cascade?.baseline_clear || 0} baseline clears · {analysis?.cascade?.ml_routed || 0} routed to ML ({pct(analysis?.cascade?.ml_fraction || 0)} observed; 30% target).</p><p>{analysis?.queue?.population || 0} distinct invoices in window · {analysis?.queue?.deferred || 0} deferred flags retained. Tiny windows round upward. Similarity identifies potential duplicates; it does not certify legitimacy.</p><button onClick={() => navigate('review')}>Open priority review queue <Icon name="chevron" size={14}/></button></Panel>
++        <div className="fs-tabs" role="tablist" aria-label="Dashboard view">{[['overview', 'Surveillance Overview'], ['rules', 'Rule Frequency & Cost Centers'], ['suppliers', 'Supplier Risk Matrix']].map(([key, label]) => <button key={key} role="tab" aria-selected={tab === key} onClick={() => setTab(key)}>{label}</button>)}<span>{items.length} INVOICES · CURRENT BATCH</span></div>
++        {tab !== 'suppliers' ? <div className="fs-chart-grid"><Panel title={tab === 'overview' ? 'Invoice Volume & Exception Classification (7-Day)' : 'Rule Detection Frequency'} subtitle="Computed from the currently analyzed batch">{tab === 'overview' ? <Trend items={items}/> : <RuleChart items={items}/>}</Panel><Panel title="Department Risk Exposure" subtitle="Flagged invoice concentration across cost centers"><DepartmentChart items={items}/></Panel></div>
++          : <Panel title="Supplier Risk Matrix" subtitle="Highest triage score by supplier · not a fraud probability"><div className="fs-supplier-matrix">{Object.values(items.reduce((acc, item) => { const key = item.invoice.supplier_id || item.invoice.supplier; if (!acc[key] || acc[key].risk_score < item.risk_score) acc[key] = item; return acc }, {})).map((item) => <button key={item.invoice.id} onClick={() => setSelected(item)}><strong>{item.invoice.supplier}</strong><Badge value={item.severity}/><span>{item.risk_score}/100 triage score</span><small>{item.anomaly.prior_count} prior supplier invoices</small></button>)}</div></Panel>}
++        <div className="fs-workbench"><Panel title="Active Exceptions Under Surveillance" subtitle="Review the evidence behind each flagged invoice" action={<button onClick={() => navigate('exceptions')}>Full Workbench <Icon name="chevron" size={14}/></button>}><InvoiceTable items={flagged} onOpen={setSelected} compact/></Panel></div>
++      </>}
++
++      {(page === 'invoices' || page === 'exceptions') && <>
++        <section className="fs-panel fs-filters"><div className="fs-filter-line"><label className="fs-search"><Icon name="search"/><input value={search} onChange={(event) => setSearch(event.target.value)} aria-label="Filter invoice results" placeholder="Search by invoice number, supplier name, or rule reason…"/></label>
++          {page === 'exceptions' ? <select aria-label="Rule filter" value={rule} onChange={(event) => setRule(event.target.value)}><option value="ALL">All Automated Rules</option>{Object.entries(LABELS).map(([key, label]) => <option key={key} value={key}>{label}</option>)}</select> : <select aria-label="Department filter" value={department} onChange={(event) => setDepartment(event.target.value)}><option value="ALL">All Departments</option>{[...new Set(items.map((item) => item.invoice.department))].map((name) => <option key={name}>{name}</option>)}</select>}
++        </div><div className="fs-filter-chips"><span><Icon name="filter" size={14}/>{page === 'exceptions' ? 'Severity Filter:' : 'Status:'}</span>{(page === 'exceptions' ? ['ALL', 'CRITICAL', 'HIGH', 'MEDIUM', 'LOW'] : ['ALL', 'FLAGGED', 'CLEARED']).map((value) => <button key={value} className={(page === 'exceptions' ? severity : status) === value ? 'selected' : ''} onClick={() => page === 'exceptions' ? setSeverity(value) : setStatus(value)}>{value}</button>)}</div></section>
++        <Panel title={page === 'exceptions' ? 'Active Exceptions Under Surveillance' : 'Invoice Registry'} subtitle={`${registryItems.length} matching invoices · open a record to inspect evidence`}><InvoiceTable items={registryItems} onOpen={setSelected} compact={page === 'exceptions'}/></Panel>
++      </>}
++
++      {(page === 'analytics' || page === 'bi') && <>
++        <div className="fs-kpi-grid three">{[[analysis?.summary.critical || 0, 'Critical review signals', 'Caller-supplied watchlist matches'], [analysis?.summary.duplicates || 0, 'Potential duplicate pairs', 'Exact and near-duplicate evidence'], [analysis?.cascade?.ml_executed || 0, 'Isolation Forest executions', 'Only unresolved cases with enough history']].map(([value, label, context]) => <article className="fs-kpi" key={label}><small>{label}</small><strong>{value}</strong><span>{context}</span></article>)}</div>
++        <div className="fs-chart-grid"><Panel title="Rule Detection Frequency & Policy Exposure" subtitle="Which rules require the most attention?"><RuleChart items={items}/></Panel><Panel title="Department Exception Share" subtitle="Invoice counts, without currency conversion"><DepartmentChart items={items}/></Panel></div>
++        <div className="fs-workbench"><Panel title="7-Day Invoice Activity" subtitle="Current batch only · external BI integration belongs to your partner"><Trend items={items}/></Panel></div>
++      </>}
++
++      {['audit', 'review'].includes(page) && <>
++        <div className="fs-source"><span className="fs-source-tag">MERCHANTSHIELD DATABASE</span><span>{page === 'review' ? 'Human tasks: REVIEW NOW. MONITOR is a separate watch queue. All other flags remain in the ledger.' : 'Persisted invoice findings, matching evidence, ML routing and priority components. Final reviewer decisions remain with your partner.'}</span></div>
++        {auditError && <div className="fs-error" role="alert">{auditError}</div>}
++        {page === 'review' && <Panel title={invoiceLedger.finalized ? 'Finalized review window' : 'Preview allocation · intake still open'} subtitle="Finalize after the complete flagged list is ready, before assigning human tasks"><p>Freezing intake keeps selected review cases stable. Monitoring does not require human assignment. Partner-owned reviewer decisions remain separate.</p><button disabled={invoiceLedger.finalized || !analysis?.audit_persisted} onClick={finalizeQueue}>{invoiceLedger.finalized ? 'Queue finalized' : 'Freeze intake & finalize queue'}</button></Panel>}
++        <Panel title={page === 'review' ? 'Allocated Review & Monitoring Cases' : 'Descriptive Invoice Audit Trail'} subtitle={`${invoiceLedger.population || 0} records · page ${Math.floor(invoiceLedger.offset / 200) + 1}`}><InvoiceTable items={invoiceLedger.items} onOpen={setSelected}/>{invoiceLedger.items.map((item) => <details key={item.invoice.id}><summary>{item.invoice.invoice_number} · {item.queue.tier.replaceAll('_', ' ')} · inspect complete evidence</summary><pre>{JSON.stringify(item, null, 2)}</pre></details>)}<div className="fs-heading-actions"><button disabled={invoiceLedger.offset === 0} onClick={() => changeLedgerPage(Math.max(0, invoiceLedger.offset - 200))}>Previous</button><button disabled={!invoiceLedger.has_more} onClick={() => changeLedgerPage(invoiceLedger.offset + 200)}>Next</button></div></Panel>
++      </>}
++      {page === 'audit' && <>
++        <Panel title="Event Verification Stream" subtitle="Recent transaction decisions from the existing backend"><div className="fs-audit-stream">{audit.map((event, index) => <article key={event.request_id || index}><span className="fs-audit-icon"><Icon name="shield"/></span><div><div className="fs-audit-head"><strong>MerchantShield decision engine</strong><small>{event.timestamp || event.created_at || ''}</small></div><Badge value={event.action || 'RECORDED'}/><p>Transaction {event.transaction_id || '—'}</p><p>{event.policy_reason || event.reason || 'Inspect the complete record for decision evidence.'}</p><details><summary>Inspect stored record</summary><pre>{JSON.stringify(event, null, 2)}</pre></details></div></article>)}{!audit.length && <div className="fs-empty">No transaction audit records yet. Run a transaction evaluation to create one.</div>}</div></Panel>
++      </>}
++      {page === 'transactions' && <div className="fs-legacy"><TransactionWorkspace/></div>}
++    </main><footer className="fs-content-footer">FinSight · Bounded review, complete evidence<span>No automatic payment actions</span></footer></div>
++
++    {selected && <Investigation item={selected} onClose={() => setSelected(null)} onHandoff={(handoff) => { download(`review-handoff-${handoff.invoice_id}.json`, handoff); setToast('Review handoff downloaded. No decision was saved.'); setSelected(null) }}/ >}
++    {copilot && <Copilot items={items} onClose={() => setCopilot(false)}/ >}
++    {upload && <Modal title="Batch Ingestion" onClose={() => setUpload(false)}><p className="fs-subtitle">Analyze up to 500 invoices. JSON can include supplier history and policy.</p>
++      <div className="fs-upload-area"><Icon name="upload" size={36}/><h3>Upload an invoice batch</h3><p>CSV or JSON · maximum 2 MB</p><label className="fs-upload-input">Choose file<input type="file" accept=".csv,.json" disabled={loading} onChange={(event) => importFile(event.target.files?.[0])}/></label></div>
++      {error && <p className="fs-error" role="alert">{error}</p>}
++      <div className="fs-upload-info"><h3>Required invoice columns</h3><code>id, invoice_number, supplier, department, amount, date, description</code><p>Optional: supplier_id, currency, po_number, tax_id. Dates use YYYY-MM-DD. CSV has no external history or department limits; use JSON to supply them.</p><button disabled={!input} onClick={() => download('finsight-input-template.json', input)}>Download current input as JSON</button><button disabled={loading} onClick={async () => { setLoading(true); await loadDemo(); setUpload(false) }}>Load included demonstration</button></div>
++    </Modal>}
++    {toast && <div className="fs-toast" role="status">{toast}</div>}
++  </div>
++}
+--- original/frontend/src/styles/FinSight.css
++++ updated/frontend/src/styles/FinSight.css
+@@ -0,0 +1,191 @@
++:root { font-family: Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; color:#111827; background:#f7f8fb; font-synthesis:none }
++* { box-sizing:border-box } body { margin:0 } button,input,select,textarea { font:inherit }
++button { cursor:pointer } button:disabled { cursor:wait; opacity:.55 }
++button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible { outline:3px solid #84a4ff; outline-offset:3px }
++.finsight button,.fs-dialog button { display:inline-flex; align-items:center; justify-content:center; gap:7px; border:1px solid #dce1e9; border-radius:5px; background:white; padding:8px 12px; font-size:.875rem; font-weight:500; color:#273449 }
++.finsight button:hover,.fs-dialog button:hover { background:#eff3fd }
++.finsight input,.finsight select,.fs-dialog input,.fs-dialog select,.fs-dialog textarea { border:1px solid #dfe4eb; border-radius:5px; padding:10px 12px; color:#1c2738; background:#f8f9fc; min-width:0 }
++.finsight input::placeholder,.fs-dialog input::placeholder { color:#8c96a8 }
++.fs-sidebar { position:fixed; inset:0 auto 0 0; width:246px; background:#101624; color:#acb6c8; display:flex; flex-direction:column; z-index:20; border-right:1px solid #1d2637; overflow-y:auto }
++.fs-brand { display:flex; align-items:center; gap:11px; padding:24px 21px 22px; border-bottom:1px solid #1c2535 }
++.fs-logo { display:flex; align-items:center; justify-content:center; width:36px; height:36px; flex-shrink:0; border-radius:8px; color:white; background:linear-gradient(140deg,#0895d0,#3153f3); box-shadow:0 3px 15px #2451f52b }
++.fs-brand strong { display:block; font-size:1.1rem; color:#fff; letter-spacing:-.6px }
++.fs-brand strong small { display:inline-block; font-size:.65rem; letter-spacing:.5px; padding:3px 5px; border-radius:3px; background:#203558; color:#85b5ff; margin-left:3px; vertical-align:middle }
++.fs-brand span:not(.fs-logo) { font-size:.75rem; display:block; margin-top:3px; color:#8c99b1 }
++.fs-persona { margin:20px 15px; display:flex; align-items:center; gap:10px; padding:15px 12px; background:#181f2e; border:1px solid #242d40; border-radius:7px }
++.fs-persona strong { display:block; font-size:.875rem; font-weight:500; color:#dae1ed }
++.fs-persona small { display:block; font-size:.7rem; color:#79a1f1; margin-top:5px }
++.fs-dot { height:7px; width:7px; border-radius:50%; background:#37b98a }
++.fs-nav-label { font-size:.67rem; letter-spacing:1.1px; color:#77839a; padding:3px 22px 10px; margin-top:5px }
++.fs-sidebar nav { display:flex; flex-direction:column; gap:5px; padding:0 12px 22px }
++.fs-sidebar nav button { justify-content:flex-start; width:100%; border:0; background:transparent; color:#aeb8ca; padding:11px 12px; text-align:left; font-size:.84rem; gap:11px }
++.fs-sidebar nav button span { flex:1 }
++.fs-sidebar nav button:hover { background:#1d273a }
++.fs-sidebar nav button.active { background:#2851e8; color:#fff; box-shadow:0 2px 5px #18389444 }
++.fs-sidebar nav button small { font-size:.6rem; color:#8998b2; white-space:nowrap }
++.fs-sidebar nav button .fs-active-count { color:#ac1f47; background:#fce5eb; border-radius:12px; padding:3px 5px }
++.fs-sidebar-footer { margin-top:auto; padding:18px 17px; border-top:1px solid #232b3a; line-height:1.6 }
++.fs-sidebar-footer strong { font-size:.75rem; display:block; color:#c6d0e0 }
++.fs-sidebar-footer span,.fs-sidebar-footer small { font-size:.65rem; display:block; color:#8291ab }
++.fs-main { margin-left:246px; min-height:100vh; display:flex; flex-direction:column; background:#f7f8fb }
++.fs-topbar { height:66px; background:#fff; border-bottom:1px solid #e5e8ef; padding:0 26px; display:flex; align-items:center; gap:24px; position:sticky; top:0; z-index:10 }
++.fs-global-search { display:flex; align-items:center; gap:8px; background:#f8f9fc; border:1px solid #e4e8ef; border-radius:5px; width:100%; max-width:470px; padding:0 10px; color:#9ba5b7 }
++.fs-global-search input { border:0; background:transparent; width:100%; font-size:.875rem }
++.fs-topbar-actions { display:flex; align-items:center; gap:12px; margin-left:auto; flex-shrink:0 }
++.finsight .fs-dark { background:#101624; color:#e8edf9; border-color:#101624 }
++.finsight .fs-dark:hover { background:#24304a }
++.fs-dark small { font-size:.6rem; background:#2d3648; padding:2px 3px }
++.fs-api-state { display:flex; align-items:center; gap:6px; font-size:.75rem; white-space:nowrap; color:#637184 }
++.fs-api-state i { width:6px; height:6px; border-radius:50%; background:#e05252 }
++.fs-api-state i.ready { background:#25b189 }
++.fs-role-select { display:flex; align-items:center; gap:6px; padding-left:10px; border-left:1px solid #e9ecf1; color:#788498 }
++.fs-role-select select { border:0; background:white; font-size:.75rem; text-transform:uppercase; padding:5px 0; max-width:95px }
++.finsight .fs-user { border:0; padding:5px; font-size:.8rem; background:transparent }
++.fs-user span { width:26px; height:26px; border-radius:50%; display:grid; place-items:center; background:#111827; color:white; font-size:.65rem }
++.fs-content { padding:28px 30px 40px; max-width:1800px; width:100%; margin:0 auto; flex:1 }
++.fs-page-heading { display:flex; align-items:center; justify-content:space-between; gap:18px; border-bottom:1px solid #e1e5ed; padding-bottom:19px; margin-bottom:22px }
++.fs-page-heading h1 { font-size:1.35rem; line-height:1.3; margin:0 0 6px; font-weight:700; letter-spacing:-.45px; display:flex; gap:10px; align-items:center }
++.fs-page-heading h1 svg { color:#3156d7; flex-shrink:0 }
++.fs-page-heading p,.fs-subtitle { margin:0; color:#718097; font-size:.875rem; line-height:1.6 }
++.fs-heading-actions { display:flex; gap:8px; flex-shrink:0 }
++.fs-source { display:flex; align-items:center; gap:10px; font-size:.75rem; color:#758195; line-height:1.6; margin:0 0 20px }
++.fs-source-tag { background:#edf1fd; color:#4360a9; font-size:.63rem; letter-spacing:.6px; padding:4px 6px; white-space:nowrap; border-radius:3px }
++.fs-kpi-grid { display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); gap:15px; margin-bottom:23px }
++.fs-kpi { border:1px solid #e5e9ef; border-radius:5px; background:white; padding:18px 16px; min-height:119px }
++.fs-kpi small { display:block; font-size:.75rem; font-weight:600; color:#6a768a; margin-bottom:8px }
++.fs-kpi strong { font-size:1.5rem; color:#111827; letter-spacing:-.5px; display:block; white-space:nowrap; line-height:1.25 }
++.fs-kpi span { font-size:.75rem; color:#7b879a; display:block; margin-top:7px; line-height:1.5 }
++.fs-kpi-grid.three { grid-template-columns:repeat(3,minmax(0,1fr)) }
++.fs-tabs { display:flex; border-bottom:1px solid #e1e5ed; gap:4px; margin-bottom:24px; align-items:center }
++.finsight .fs-tabs button { border:0; border-bottom:2px solid transparent; border-radius:0; background:transparent; color:#7b8799; padding:14px 12px; font-size:.84rem }
++.finsight .fs-tabs button[aria-selected=true] { color:#101827; border-bottom-color:#111827; font-weight:600 }
++.fs-tabs>span { margin-left:auto; font-size:.65rem; color:#8592a5; letter-spacing:.5px }
++.fs-chart-grid { display:grid; grid-template-columns:minmax(0,1.9fr) minmax(280px,1fr); gap:20px }
++.fs-panel { background:white; border:1px solid #e2e6ee; border-radius:8px; overflow:hidden; box-shadow:0 1px 2px #17284a03 }
++.fs-panel-heading { padding:18px 20px; border-bottom:1px solid #eff1f5 }
++.fs-panel-heading h2 { font-size:.875rem; font-weight:600; margin:0 0 5px; color:#273143 }
++.fs-panel-heading p { font-size:.75rem; color:#7e8a9d; margin:0; line-height:1.5 }
++.fs-panel-heading.inline { display:flex; align-items:center; justify-content:space-between; gap:15px }
++.fs-trend { padding:23px 20px 8px }
++.fs-trend>svg { width:100%; display:block }
++.fs-legend { display:flex; align-items:center; gap:17px; font-size:.75rem; margin-bottom:10px; color:#4e5a6c }
++.fs-legend span { display:flex; gap:6px; align-items:center }
++.fs-legend i,.fs-dept-list i { width:7px; height:7px; display:inline-block; border-radius:50%; flex-shrink:0 }
++.fs-legend small { margin-left:auto; color:#7f8da3; letter-spacing:1px; font-size:.6rem }
++.fs-chart-note { font-size:.75rem; line-height:1.5; color:#758297; margin:9px 0 }
++.fs-donut { width:172px; height:172px; margin:30px auto 24px; border-radius:50%; display:grid; place-items:center; transform:rotate(-25deg) }
++.fs-donut>div { background:white; border-radius:50%; width:121px; height:121px; display:flex; flex-direction:column; justify-content:center; align-items:center; transform:rotate(25deg); border:5px solid white }
++.fs-donut small { font-size:.65rem; color:#7c8798; letter-spacing:.8px }
++.fs-donut strong { font-size:1.65rem; margin-top:7px }
++.fs-dept-list { list-style:none; padding:0 22px 18px; margin:0 }
++.fs-dept-list li { display:flex; justify-content:space-between; font-size:.75rem; gap:10px; padding:8px 0; border-bottom:1px solid #f0f2f6 }
++.fs-dept-list li:last-child { border:0 }
++.fs-dept-list span { display:flex; align-items:center; gap:8px }
++.fs-dept-list strong { font-weight:500; white-space:nowrap }
++.fs-dept-list small { color:#8691a3; font-size:.7rem; font-weight:400; margin-left:4px }
++.fs-workbench { margin-top:25px }
++.fs-table-scroll { overflow-x:auto }
++.fs-table { width:100%; border-collapse:collapse; font-size:.875rem; text-align:left; min-width:830px; table-layout:fixed }
++.fs-table th { color:#7b8798; font-size:.65rem; font-weight:600; letter-spacing:.55px; text-transform:uppercase; padding:17px 18px; background:#fcfcfe; border-bottom:1px solid #e6eaf0 }
++.fs-table td { padding:20px 18px; vertical-align:middle; border-bottom:1px solid #eef1f6; color:#364256; line-height:1.55; overflow-wrap:anywhere }
++.fs-table tbody tr:last-child td { border:0 }
++.fs-table tbody tr:hover { background:#fbfcff }
++.fs-table strong { font-size:.875rem; font-weight:500; color:#1c293d }
++.fs-table th:nth-child(1) { width:14% }.fs-table th:nth-child(2) { width:17% }.fs-table th:nth-child(3) { width:13% }.fs-table th:nth-child(4) { width:17% }.fs-table th:nth-child(5) { width:10% }.fs-table th:nth-child(6) { width:20% }.fs-table th:last-child { width:9% }
++.fs-table small { display:block; font-size:.75rem; color:#7c8aa1; margin-top:5px }
++.fs-mono { font-family:ui-monospace,SFMono-Regular,monospace }
++.fs-table .fs-amount { font-size:.875rem; font-weight:650; color:#172338; white-space:nowrap }
++.fs-reason { display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; font-size:.8rem; line-height:1.6; color:#707f95 }
++.fs-badge { display:inline-block; white-space:nowrap; font-size:.63rem; font-weight:650; letter-spacing:.6px; padding:4px 7px; border:1px solid #e4e9f0; background:#f0f3f8; border-radius:4px; color:#647185; vertical-align:middle }
++.fs-badge.critical,.fs-badge.flagged,.fs-badge.block { background:#fff0f4; color:#b72057; border-color:#f5dce5 }
++.fs-badge.high { background:#fffbea; color:#956511; border-color:#f3eac4 }
++.fs-badge.medium { background:#fff6eb; color:#a65e0b; border-color:#f8e4c9 }
++.fs-badge.low,.fs-badge.cleared,.fs-badge.allow { background:#eaf9f0; color:#248e61; border-color:#d4efdf }
++.finsight .fs-small-button { border:0; background:#f1f4f8; color:#374358; border-radius:3px; padding:6px 9px; font-size:.75rem }
++.fs-filters { padding:19px; margin-bottom:20px }.fs-filter-line { display:flex; gap:13px }
++.fs-filter-line>select { min-width:210px; font-size:.8rem }
++.fs-search { display:flex; align-items:center; gap:8px; border:1px solid #e3e7ef; border-radius:5px; background:#f8f9fc; padding:0 10px; width:100%; color:#9ba5b5 }
++.fs-search input { width:100%; border:0; background:transparent; font-size:.875rem }
++.fs-filter-chips { display:flex; align-items:center; gap:7px; flex-wrap:wrap; margin-top:16px }
++.fs-filter-chips>span { display:flex; align-items:center; gap:5px; color:#7b899f; font-size:.75rem; margin-right:7px }
++.finsight .fs-filter-chips button { padding:5px 9px; border:0; background:#f2f4f8; font-size:.67rem; color:#637186 }
++.finsight .fs-filter-chips button.selected { background:#111827; color:white }
++.fs-rule-chart { padding:32px 26px; min-height:315px }
++.fs-rule-chart>div { display:grid; grid-template-columns:185px 1fr 20px; align-items:center; gap:13px; font-size:.75rem; margin-bottom:25px }
++.fs-rule-chart>div>span { text-align:right; color:#667184 }
++.fs-rule-chart>div>div { height:9px; position:relative; background:#f4f6f9; border-radius:2px }
++.fs-rule-chart i { display:block; background:#1d293b; height:9px; border-radius:2px }
++.fs-rule-chart strong { font-size:.75rem; color:#708099 }
++.fs-supplier-matrix { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); padding:20px; gap:15px }
++.finsight .fs-supplier-matrix button { align-items:flex-start; flex-direction:column; padding:20px; text-align:left; gap:10px }
++.fs-supplier-matrix small { color:#7c8a9f }
++.fs-content-footer { padding:20px 30px; display:flex; justify-content:space-between; gap:15px; color:#7d8ba2; font-size:.7rem; border-top:1px solid #e4e8ee }
++.fs-error { display:flex; justify-content:space-between; align-items:center; background:#fff0f2; border:1px solid #f4cbd3; color:#ad2543; padding:14px; border-radius:5px; font-size:.875rem; margin-bottom:15px; word-break:break-word }
++.fs-error button { background:transparent!important; border:0!important }
++.fs-loading { padding:12px 14px; background:#edf2ff; color:#3957b8; border:1px solid #d9e2fc; font-size:.875rem; border-radius:5px; margin-bottom:16px }
++.fs-empty { padding:60px 20px; text-align:center; color:#8391a7; font-size:.875rem }
++.fs-dialog { width:min(900px,calc(100vw - 40px)); max-height:calc(100dvh - 60px); padding:25px; background:#fff; border:1px solid #dce2ee; border-radius:16px; box-shadow:0 20px 70px #050c2244; color:#273449; overflow:auto }
++.fs-dialog::backdrop { background:#10182788; backdrop-filter:blur(3px) }
++.fs-dialog-head { display:flex; align-items:center; justify-content:space-between; gap:20px; margin-bottom:7px }
++.fs-dialog h2 { font-size:1.18rem; margin:0; font-weight:650; letter-spacing:-.35px }
++.fs-dialog .fs-icon-button,.finsight .fs-icon-button { border:0; background:transparent; padding:5px; color:#7d8ba1 }
++.fs-dialog>.fs-subtitle { margin-bottom:23px }
++.fs-investigation-banner { background:#101624; display:flex; align-items:center; gap:18px; color:#d6dfef; padding:22px; border-radius:10px; margin:26px 0; box-shadow:0 5px 15px #10162412 }
++.fs-investigation-banner>svg { color:#ed3a76; flex-shrink:0 }
++.fs-investigation-banner strong { display:block; font-size:1rem }
++.fs-investigation-banner small { display:block; font-size:.75rem; color:#9aaac3; margin-top:7px }
++.fs-investigation-banner .fs-badge { margin-left:6px }
++.fs-investigation-amount { margin-left:auto; text-align:right; white-space:nowrap }
++.fs-investigation-amount strong { color:#f1d567; font-size:1.2rem; margin-top:5px }
++.fs-investigation-amount small { font-size:.63rem; letter-spacing:.7px }
++.fs-evidence-section { border:1px solid #e1e6ef; background:#f8f9fc; border-radius:9px; padding:18px; margin:16px 0 }
++.fs-evidence-section h3 { display:flex; align-items:center; gap:9px; font-size:.78rem; text-transform:uppercase; letter-spacing:.45px; color:#3a485d; margin:0 0 15px }
++.fs-evidence-section h3>span { border-radius:50%; background:#2851e8; width:22px; height:22px; display:grid; place-items:center; color:white; font-size:.7rem; flex-shrink:0 }
++.fs-evidence-section>p { margin:0; background:white; border:1px solid #e5e9f0; border-radius:5px; padding:14px; font-size:.875rem; line-height:1.65 }
++.fs-evidence-section.warm { background:#fffef5; border-color:#f1e9bd }.fs-evidence-section.warm h3>span { background:#cd8b20 }
++.fs-evidence-section.blue { background:#f4f8ff }
++.fs-evidence-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px }
++.fs-evidence-grid article { background:white; border:1px solid #e8e6d2; padding:15px; border-radius:6px }
++.fs-evidence-grid strong { display:block; font-size:.875rem; margin-bottom:6px }
++.fs-evidence-grid code { font-size:.66rem; word-break:break-word; color:#8d783d; background:#f8f5e8; padding:3px 5px }
++.fs-evidence-grid p { font-size:.875rem; color:#727d8e; line-height:1.6; margin-bottom:0 }
++.fs-model-context { display:flex; flex-direction:column; gap:7px; font-size:.875rem; color:#748093; margin-top:18px }.fs-model-context strong { color:#4c5363 }
++.fs-comparison { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:14px }
++.fs-comparison article { border:1px solid #e0e6f3; border-radius:7px; padding:16px; background:white }.fs-comparison article:last-child { border-color:#adbef8; background:#fafbff }
++.fs-comparison small { font-size:.65rem; color:#6981bb; letter-spacing:.7px }.fs-comparison h4 { font-family:ui-monospace,monospace; font-size:.94rem; margin:10px 0 15px }
++.fs-comparison dl { font-size:.875rem; margin:0 }.fs-comparison dt { color:#738199; font-size:.75rem; margin-top:10px }.fs-comparison dd { margin:3px 0 0; line-height:1.6; color:#364256 }
++.fs-match-metrics { display:grid; grid-template-columns:repeat(4,1fr); gap:12px; margin-top:16px; font-size:.75rem; color:#7c899f }.fs-match-metrics strong { display:block; font-size:.875rem; color:#2d4bb0; margin-top:6px }
++.fs-label { display:flex; flex-direction:column; gap:8px; font-size:.875rem; color:#718096; margin:17px 0 }.fs-label textarea { width:100%; min-height:100px; resize:vertical; background:white }
++.fs-dialog-actions { display:flex; justify-content:space-between; gap:12px; margin-top:20px }
++.finsight .fs-primary,.fs-dialog .fs-primary,.fs-login .fs-primary { background:#2851e8; color:white; border:1px solid #2851e8 }.fs-primary:hover { background:#1c3eca!important }
++.fs-dialog.drawer { position:fixed; inset:0 0 0 auto; margin:0; border-radius:0; border:0; width:470px; max-width:100vw; height:100dvh; max-height:100dvh; background:#101624; color:#e1e8f5; display:flex; flex-direction:column; padding:21px 20px }
++.fs-dialog.drawer .fs-dialog-head { padding-bottom:13px; border-bottom:1px solid #283146 }.fs-dialog.drawer .fs-subtitle { font-size:.75rem; color:#91a3be; margin-bottom:15px }
++.fs-suggestions { display:flex; gap:6px; padding-bottom:18px }.fs-dialog .fs-suggestions button { border:1px solid #2c3548; background:#1c2435; color:#c4cfe0; border-radius:18px; font-size:.75rem; padding:7px 10px }
++.fs-messages { flex:1; overflow:auto; display:flex; flex-direction:column; gap:15px; padding:8px 0 18px }
++.fs-messages>div { background:#1c2535; border:1px solid #2b3548; border-radius:12px; padding:17px; color:#c9d4e5; font-size:.875rem; line-height:1.8 }.fs-messages small { font-size:.65rem; letter-spacing:1px; color:#80a0f9 }.fs-messages p { margin:5px 0 }.fs-messages .user { background:#223c7b; margin-left:30px }
++.fs-chat-form { display:flex; gap:8px; border-top:1px solid #283146; padding-top:16px }.fs-dialog .fs-chat-form input { width:100%; background:#1d2638; color:#d2dbec; border-color:#2b3650; font-size:.875rem }
++.fs-upload-area { padding:30px; border:2px dashed #d7e0f5; border-radius:10px; background:#f8faff; text-align:center; color:#5d79cc }.fs-upload-area h3 { font-size:1rem; color:#31425e }.fs-upload-area p { font-size:.875rem; color:#7385a0 }
++.fs-upload-input { display:block; max-width:340px; margin:20px auto 0; font-size:.875rem; color:#344761 }.fs-upload-input input { display:block; width:100%; margin-top:10px; background:white }
++.fs-upload-info { margin-top:25px; font-size:.875rem; color:#7a879c; line-height:1.65 }.fs-upload-info h3 { font-size:.9rem; color:#3d4c64 }.fs-upload-info code { display:block; font-size:.75rem; word-break:break-word; padding:12px; background:#f5f7fb; color:#5b6a83; border-radius:5px }.fs-upload-info button { margin-right:8px; margin-top:10px }
++.fs-toast { position:fixed; bottom:25px; left:50%; transform:translateX(-50%); padding:15px 22px; background:#12213b; border:1px solid #33456b; color:#e0eaff; box-shadow:0 8px 25px #11182730; border-radius:8px; font-size:.875rem; max-width:calc(100vw - 30px); z-index:100 }
++.fs-audit-stream { padding:24px }.fs-audit-stream>article { display:flex; gap:15px; padding:15px 0; border-bottom:1px solid #e8edf5 }.fs-audit-stream>article>div { flex:1; background:#f8f9fc; border:1px solid #e5eaf3; border-radius:8px; padding:18px }.fs-audit-icon { color:#2851e8; padding-top:15px }.fs-audit-head { display:flex; align-items:center; justify-content:space-between; gap:10px; font-size:.875rem; margin-bottom:12px }.fs-audit-head small { font-size:.75rem; color:#798ba5 }.fs-audit-stream p { font-size:.875rem; line-height:1.6 }.fs-audit-stream details { font-size:.75rem; color:#64748b }.fs-audit-stream pre { white-space:pre-wrap; word-break:break-word; font-size:.75rem }
++.fs-login { min-height:100dvh; display:grid; place-items:center; background:radial-gradient(ellipse at 40% 40%,#1a2a43,transparent 55%),radial-gradient(ellipse at 90% 90%,#1a2251,transparent 70%),#161d2a; color:#e5ebf5; padding:30px }
++.fs-login-wrap { width:460px; max-width:100%; text-align:center }.fs-login .fs-brand { border:0; padding:0; justify-content:center }.fs-login .fs-logo { width:50px; height:50px; border-radius:11px }.fs-login .fs-brand strong { font-size:1.6rem }.fs-login .fs-brand span:not(.fs-logo) { font-size:.8rem }.fs-login h1 { font-size:1.15rem; font-weight:500; margin:19px 0 36px }
++.fs-login-card { text-align:left; padding:34px 38px; background:#101624; border:1px solid #242c3e; border-radius:15px; box-shadow:0 15px 50px #02061510 }.fs-login .fs-label { font-size:.875rem; color:#aab6cb }.fs-login .fs-label:first-child { font-size:.75rem; letter-spacing:1px; margin-top:0 }
++.fs-login .fs-role-options { display:grid; grid-template-columns:repeat(3,1fr); gap:9px }.fs-role-options button { padding:12px 5px; background:#1a2232; color:#a8b6cf; border:1px solid #2b3448; border-radius:8px; cursor:pointer }.fs-role-options button strong { display:block; font-size:.875rem }.fs-role-options button small { display:block; font-size:.65rem; margin-top:4px }.fs-role-options button.selected { background:#19362e; border-color:#31866b; color:#85d4b5 }
++.fs-login input { width:100%; padding:13px; border:1px solid #2a354b; border-radius:7px; background:#1b2435; color:#cfdaed }.fs-enter { width:100%; padding:13px; border-radius:7px; font-size:.9rem; margin-top:8px }.fs-login-footer { display:flex; gap:8px; align-items:center; border-top:1px solid #283144; margin-top:24px; padding-top:20px; color:#8c9eb9; font-size:.75rem; line-height:1.5 }.fs-login-footer svg { color:#50bc95; flex-shrink:0 }
++.fs-mobile-menu { display:none!important }.fs-legacy .app-shell { max-width:none; margin:0; padding:0 }.fs-legacy .app-header { border-radius:8px }.fs-legacy .context-bar { display:none }.fs-legacy .app-title { font-size:1.25rem }.fs-legacy .app-tagline { font-size:.875rem }.fs-legacy button { display:inline-flex }.fs-legacy main { padding:0 }
++@media (min-width:1600px) { .fs-chart-grid { grid-template-columns:minmax(0,2fr) minmax(320px,1fr) }.fs-content { padding:30px 34px }.fs-kpi strong { font-size:1.8rem } }
++@media (max-width:1250px) {
++ .fs-topbar { gap:12px; padding:0 20px }.fs-topbar-actions { gap:8px }.fs-topbar .fs-user { font-size:0; gap:0 }.fs-user span { font-size:.65rem }.fs-topbar .fs-api-state { display:none }.fs-kpi-grid { gap:10px }.fs-kpi { padding:16px 11px }.fs-kpi strong { font-size:1.2rem }.fs-content { padding:24px 20px }.fs-tabs>span { display:none }.fs-sidebar { width:225px }.fs-main { margin-left:225px }.fs-sidebar nav button { font-size:.8rem }.fs-chart-grid { grid-template-columns:minmax(0,1.6fr) minmax(250px,1fr) }.fs-rule-chart>div { grid-template-columns:130px 1fr 20px }
++}
++@media (max-width:1000px) {
++ .fs-sidebar { width:210px }.fs-main { margin-left:210px }.fs-topbar-actions>button:nth-child(2) { display:none }.fs-role-select { display:none }.fs-kpi-grid { grid-template-columns:repeat(3,1fr) }.fs-chart-grid { grid-template-columns:1fr }.fs-donut { margin:25px auto }.fs-dept-list { max-width:480px; margin:0 auto }.fs-page-heading { align-items:flex-start; flex-direction:column }.fs-filter-line>select { min-width:160px; max-width:190px }.fs-supplier-matrix { grid-template-columns:repeat(2,1fr) }.fs-content-footer span { display:none }.fs-evidence-grid { grid-template-columns:1fr }
++}
++@media (max-width:700px) {
++ .fs-sidebar { display:none; width:246px; box-shadow:20px 0 50px #10182730 }.fs-sidebar.open { display:flex }.fs-main { margin-left:0 }.fs-mobile-menu { display:flex!important; z-index:30 }.fs-topbar { height:61px; padding:0 15px; gap:8px }.fs-global-search { min-width:0; flex:1 }.fs-global-search input { font-size:.75rem }.fs-topbar-actions { gap:6px }.fs-topbar .fs-dark { font-size:0; padding:7px }.fs-topbar .fs-dark small { display:none }.fs-topbar .fs-user { display:none }.fs-content { padding:23px 15px }.fs-page-heading h1 { font-size:1.15rem }.fs-page-heading p { font-size:.875rem }.fs-heading-actions button { font-size:.75rem }.fs-kpi-grid { grid-template-columns:repeat(2,1fr) }.fs-kpi-grid.three { grid-template-columns:1fr }.fs-kpi strong { font-size:1.35rem }.fs-kpi-grid>.fs-kpi:last-child:nth-child(odd) { grid-column:span 2 }.fs-kpi-grid.three>.fs-kpi:last-child { grid-column:auto }.fs-tabs { gap:0; overflow-x:auto }.finsight .fs-tabs button { font-size:.75rem; padding:13px 10px; white-space:nowrap }.fs-source { align-items:flex-start; flex-direction:column; font-size:.75rem }.fs-panel-heading { padding:16px }.fs-legend { gap:10px; font-size:.65rem }.fs-legend small { display:none }.fs-trend { padding:18px 10px 8px }.fs-filter-line { flex-direction:column }.fs-filter-line>select { max-width:none; width:100% }.fs-filter-chips { gap:5px }.fs-dialog { padding:19px; width:calc(100vw - 20px); max-height:calc(100dvh - 25px); border-radius:12px }.fs-dialog h2 { font-size:1rem }.fs-investigation-banner { flex-wrap:wrap; padding:17px; gap:12px }.fs-investigation-amount { margin-left:40px; text-align:left }.fs-comparison { grid-template-columns:1fr }.fs-match-metrics { grid-template-columns:repeat(2,1fr) }.fs-dialog-actions { flex-direction:column }.fs-dialog-actions button { width:100% }.fs-rule-chart { padding:24px 16px; min-height:250px }.fs-rule-chart>div { grid-template-columns:135px 1fr 18px; font-size:.75rem; gap:9px }.fs-supplier-matrix { grid-template-columns:1fr }.fs-audit-stream { padding:15px }.fs-audit-head { flex-direction:column; align-items:flex-start }.fs-login-card { padding:28px 24px }.fs-login h1 { font-size:1rem }.fs-topbar .fs-global-search { max-width:none }.fs-content-footer { padding:18px 15px }.fs-panel-heading.inline { align-items:flex-start; flex-direction:column }.fs-legacy .main-grid { display:block }.fs-legacy .app-header { flex-direction:column }.fs-legacy .header-status { width:100% }.fs-legacy .header-status-meta { flex-wrap:wrap }
++}
++@media (prefers-reduced-motion:reduce) { * { scroll-behavior:auto!important; animation:none!important; transition:none!important } }
++.fs-content details { margin: 12px 20px; font-size: 12px; }
++.fs-content details summary { cursor: pointer; padding: 8px 0; }
++.fs-content details pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 380px; overflow: auto; background: #f4f6fa; padding: 12px; border-radius: 6px; }
+--- original/frontend/src/api/client.js
++++ updated/frontend/src/api/client.js
+@@ -46,6 +46,11 @@
+ }
+ 
+ export const api = {
++  getInvoiceDemo: () => request("/ap/demo"),
++  analyzeInvoices: (payload) => request("/ap/analyze", { method: "POST", body: JSON.stringify(payload) }),
++  importInvoices: (csv_text) => request("/ap/import", { method: "POST", body: JSON.stringify({ csv_text }) }),
++  getInvoiceAudit: (windowId = 'default', offset = 0, tier = 'ALL') => request(`/ap/audit?window_id=${encodeURIComponent(windowId)}&limit=200&offset=${offset}&tier=${tier}`),
++  finalizeInvoiceWindow: (windowId = 'default') => request(`/ap/windows/${encodeURIComponent(windowId)}/finalize`, { method: 'POST' }),
+   getHealth: () => request("/health"),
+ 
+   getModelInfo: () => request("/model/info"),
+--- original/tests/test_invoices.py
++++ updated/tests/test_invoices.py
+@@ -0,0 +1,166 @@
++"""AP contract, duplicate boundary cases and strictly-prior anomaly evidence."""
++
++import json
++
++import pytest
++from fastapi import FastAPI
++from fastapi.testclient import TestClient
++from pydantic import ValidationError
++
++from backend.invoices import AnalysisRequest, Invoice, analyze, demo_invoices, router
++
++
++@pytest.fixture
++def ap_client():
++    app = FastAPI()
++    app.include_router(router)
++    with TestClient(app) as client:
++        yield client
++
++
++def invoice(**changes):
++    return Invoice.model_validate({"id": "new", "invoice_number": "INV-2026-104",
++        "supplier": "Acme Supplies Ltd", "supplier_id": "acme", "department": "Operations",
++        "amount": 1000, "date": "2026-10-06", "description": "Steel bolts warehouse delivery",
++        "po_number": "PO-1", "tax_id": "TAX-1", **changes})
++
++
++def result(current=None, history=None, **policy):
++    return analyze(AnalysisRequest(invoices=[current or invoice()], history=history or [], **policy))["items"][0]
++
++
++def test_normal_invoice_with_no_history_is_not_claimed_fraud():
++    item = result()
++    assert item["status"] == "FLAGGED"
++    assert [signal["code"] for signal in item["signals"]] == ["INSUFFICIENT_HISTORY"]
++    assert item["pipeline"]["route"] == "ML_REQUIRED"
++    assert not item["pipeline"]["ml_executed"]
++    assert item["score_type"] == "triage_score_not_probability"
++    assert item["anomaly"]["method"] == "insufficient_history"
++
++
++def test_normalized_exact_duplicate():
++    item = result(history=[invoice(id="old", invoice_number="inv_2026 104", date="2026-10-01")])
++    assert item["match"]["kind"] == "EXACT_DUPLICATE"
++    assert item["match"]["matched_invoice"]["id"] == "old"
++
++
++def test_near_duplicate_returns_measured_evidence():
++    item = result(history=[invoice(id="old", invoice_number="INV-2026-104A", amount=999, date="2026-10-04")])
++    assert item["match"]["kind"] == "NEAR_DUPLICATE"
++    assert item["match"]["components"]["description_tfidf"] == 1
++    assert item["match"]["components"]["date_gap_days"] == 2
++    assert item["risk_score"] == 90
++
++
++@pytest.mark.parametrize("changes", [
++    {"supplier_id": "another"}, {"currency": "USD"}, {"date": "2026-10-07"},
++    {"invoice_number": "OTHER-REF", "description": "Annual software subscription"},
++    {"invoice_number": "INV-2026-104A", "amount": 1500},
++    {"invoice_number": "INV-2026-104A", "date": "2026-01-01"},
++])
++def test_duplicate_blocking_prevents_false_cross_context_matches(changes):
++    assert result(history=[invoice(id="old", **changes)])["match"] is None
++
++
++def test_same_name_but_different_trusted_supplier_ids_is_not_duplicate():
++    assert result(history=[invoice(id="old", supplier_id="different")])["match"] is None
++
++
++def test_missing_supplier_id_uses_name_similarity():
++    item = result(history=[invoice(id="old", supplier_id=None, supplier="Acme Supplies, Ltd.")])
++    assert item["match"] is not None
++
++
++def test_repeated_number_with_changed_amount_remains_reviewable():
++    assert result(history=[invoice(id="old", amount=1500)])["match"]["kind"] == "NEAR_DUPLICATE"
++
++
++def test_prior_anomaly_excludes_same_date_future_supplier_and_currency():
++    prior = [invoice(id=f"prior-{day}", invoice_number=f"OLD-{day}", date=f"2026-09-{day:02d}") for day in range(1, 21)]
++    excluded = [invoice(id="same-day", invoice_number="UNRELATED", amount=100000), invoice(id="future", amount=100000, date="2026-10-07"),
++                invoice(id="other", amount=100000, supplier_id="other"), invoice(id="dollars", amount=100000, currency="USD")]
++    item = result(invoice(amount=10000), prior + excluded)
++    assert item["anomaly"]["prior_count"] == 20
++    assert item["anomaly"]["median_amount"] == 1000
++    assert item["anomaly"]["amount_ratio"] == 10
++    assert item["anomaly"]["isolation_outlier"] is not None
++    assert any(signal["code"] == "AMOUNT_ANOMALY" for signal in item["signals"])
++
++
++def test_stable_amount_history_does_not_flag_tiny_variations():
++    prior = [invoice(id=f"p-{day}", invoice_number=f"OLD-{day}", date=f"2026-09-{day:02d}") for day in range(1, 7)]
++    item = result(invoice(amount=1001), prior)
++    assert item["anomaly"]["score"] == 0
++    assert item["status"] == "CLEARED"
++
++
++def test_rules_match_only_supplied_policy_and_currency():
++    item = result(invoice(po_number="", tax_id="WATCH-ME", amount=5000), watchlist_tax_ids=["watch me"], department_limits={"Operations": 1000})
++    assert {signal["code"] for signal in item["signals"]} == {"MISSING_PO", "WATCHLIST_MATCH", "DEPARTMENT_LIMIT"}
++    assert item["severity"] == "CRITICAL"
++    dollar_item = result(invoice(amount=5000, currency="USD"), department_limits={"Operations": 1000})
++    assert "DEPARTMENT_LIMIT" not in {signal["code"] for signal in dollar_item["signals"]}
++
++
++@pytest.mark.parametrize("changes", [{"amount": 0}, {"amount": -1}, {"amount": float("nan")},
++    {"amount": float("inf")}, {"amount": True}, {"supplier": "  "}, {"supplier": "---"},
++    {"date": "not-a-date"}, {"currency": "GBP"}, {"is_fraud": 1}])
++def test_invalid_or_label_leaking_invoices_are_rejected(changes):
++    with pytest.raises(ValidationError):
++        invoice(**changes)
++
++
++def test_context_limits_and_unique_ids():
++    with pytest.raises(ValidationError):
++        AnalysisRequest(invoices=[invoice()], history=[invoice()])
++    for value in [-1, float("inf"), float("nan")]:
++        with pytest.raises(ValidationError):
++            AnalysisRequest(invoices=[invoice()], department_limits={"Operations": value})
++    with pytest.raises(ValidationError):
++        AnalysisRequest(invoices=[])
++    with pytest.raises(ValidationError):
++        AnalysisRequest(invoices=[invoice(id=str(index)) for index in range(501)])
++
++
++def test_batch_is_chronological_and_matches_earlier_input():
++    older = invoice(id="older", date="2026-10-01")
++    response = analyze(AnalysisRequest(invoices=[invoice(), older]))
++    assert response["items"][0]["invoice"]["id"] == "older"
++    assert response["items"][1]["match"]["matched_invoice"]["id"] == "older"
++
++
++def test_demo_endpoint_and_analysis_contract(ap_client):
++    response = ap_client.get("/ap/demo")
++    assert response.status_code == 200
++    payload = response.json()
++    assert "Fictional" in payload.pop("provenance")
++    response = ap_client.post("/ap/analyze", json=payload)
++    assert response.status_code == 200
++    assert response.json()["summary"] == {"invoices": 6, "flagged": 5, "duplicates": 1, "critical": 1}
++    assert ap_client.post("/ap/analyze", json={"invoices": []}).status_code == 422
++    assert ap_client.post("/ap/analyze", json={**payload, "trusted_fraud_score": 1}).status_code == 422
++
++
++def test_csv_import_quoted_values_and_empty_optional_fields(ap_client):
++    text = 'id,invoice_number,supplier,department,amount,date,description,po_number,tax_id\n1,INV-1,"Acme, Ltd",Operations,1000,2026-10-06,"Steel, bolts",,\n'
++    response = ap_client.post("/ap/import", json={"csv_text": text})
++    assert response.status_code == 200
++    assert response.json()["input"]["invoices"][0]["supplier"] == "Acme, Ltd"
++    assert response.json()["analysis"]["summary"]["flagged"] == 1
++
++
++@pytest.mark.parametrize("text", ["", "id,id\n1,2", "id,is_fraud\n1,1",
++    "id,invoice_number\n1", 'id,invoice_number\n1,"unterminated', "id\n1", "id\n1,2"])
++def test_csv_malformed_or_unknown_columns_are_rejected(ap_client, text):
++    assert ap_client.post("/ap/import", json={"csv_text": text}).status_code == 422
++
++
++def test_analysis_is_stateless_and_repeated_input_reproduces_results():
++    payload = demo_invoices()
++    payload.pop("provenance")
++    request = AnalysisRequest(**payload)
++    original = json.dumps(request.model_dump(mode="json"), sort_keys=True)
++    first = analyze(request)
++    assert analyze(request) == first
++    assert json.dumps(request.model_dump(mode="json"), sort_keys=True) == original
+--- original/tests/test_invoice_priority.py
++++ updated/tests/test_invoice_priority.py
+@@ -0,0 +1,168 @@
++"""Budget, cascade and persistence invariants, independent of fraud labels."""
++
++import json
++
++import pytest
++from fastapi import FastAPI
++from fastapi.testclient import TestClient
++from pydantic import ValidationError
++from sqlalchemy import func, inspect, select
++
++from backend.invoice_priority import (
++    ReviewPolicy,
++    allocate,
++    capacities,
++    priority_evidence,
++)
++from backend.invoices import AnalysisRequest, analyze, demo_invoices, router
++from backend.services.audit_service import AuditStore
++from backend.services.invoice_audit import InvoiceAuditStore, batches
++from tests.test_invoices import invoice, result
++
++
++@pytest.fixture
++def stored_client(tmp_path):
++    audit = AuditStore(f"sqlite:///{tmp_path / 'audit.db'}")
++    app = FastAPI()
++    app.state.invoice_audit_store = InvoiceAuditStore(audit)
++    app.include_router(router)
++    with TestClient(app) as client:
++        yield client, app.state.invoice_audit_store
++    audit.engine.dispose()
++
++
++def test_million_budget_and_rounding():
++    assert capacities(1_000_000, ReviewPolicy()) == (100, 100)
++    assert capacities(2_000_000, ReviewPolicy()) == (200, 200)
++    assert capacities(6, ReviewPolicy()) == (1, 1)
++    assert capacities(1000, ReviewPolicy(reviews_per_million=0, monitors_per_million=0)) == (0, 0)
++
++
++def test_priority_formula_and_currency_conversion_are_explicit():
++    item = result(invoice(amount=10000, po_number=""))
++    policy = ReviewPolicy(review_cost_inr=100, recovery_fraction=0.5)
++    evidence = priority_evidence(item, policy)
++    assert evidence["index"] == 22.5
++    dollar = result(invoice(currency="USD", po_number=""))
++    assert priority_evidence(dollar, policy)["index"] is None
++    assert priority_evidence(dollar, ReviewPolicy(currency_to_inr={"USD": 80}))["index"] == 180
++
++
++@pytest.mark.parametrize("changes", [{"reviews_per_million": True}, {"reviews_per_million": -1},
++    {"monitors_per_million": 1.5}, {"review_cost_inr": 0}, {"review_cost_inr": float("inf")},
++    {"recovery_fraction": 1.1}, {"currency_to_inr": {"USD": -1}}, {"currency_to_inr": {"GBP": 1}}])
++def test_bad_review_policy_rejected(changes):
++    with pytest.raises(ValidationError):
++        ReviewPolicy(**changes)
++
++
++def test_critical_first_medium_monitor_and_all_flags_retained():
++    payload = demo_invoices()
++    payload.pop("provenance")
++    data = analyze(AnalysisRequest(**payload))
++    assert data["queue"]["review_now"] == data["queue"]["monitor"] == 1
++    assert data["queue"]["deferred"] == 3
++    assert data["summary"]["flagged"] == 5
++    assert next(row for row in data["items"] if row["queue"]["tier"] == "REVIEW_NOW")["severity"] == "CRITICAL"
++    assert next(row for row in data["items"] if row["queue"]["tier"] == "MONITOR")["severity"] == "MEDIUM"
++    assert data["cascade"]["ml_routed"] == data["cascade"]["ml_executed"] == 1
++    assert data["cascade"]["rule_flagged"] == 4
++    assert data["cascade"]["baseline_clear"] == 1
++    assert data["cascade"]["ml_fraction"] != 0.3
++    assert all(row["audit"]["conclusion"] and row["pipeline"]["reason"] for row in data["items"])
++
++
++def test_rule_and_duplicate_cases_never_fit_isolation_forest(monkeypatch):
++    def forbidden(*args, **kwargs):
++        raise AssertionError("ML should have been gated out")
++    monkeypatch.setattr("backend.invoices.IsolationForest", forbidden)
++    assert not result(invoice(po_number=""))["pipeline"]["ml_executed"]
++    assert not result(history=[invoice(id="old", date="2026-10-01")])["pipeline"]["ml_executed"]
++    history = [invoice(id=f"p{i}", invoice_number=f"OLD-{i}", date=f"2026-09-{i:02d}") for i in range(1, 21)]
++    assert result(history=history)["pipeline"]["route"] == "BASELINE_CLEAR"
++
++
++def test_zero_budget_retains_critical_overflow():
++    payload = demo_invoices()
++    payload.pop("provenance")
++    payload["review_policy"] = {"reviews_per_million": 0, "monitors_per_million": 0}
++    data = analyze(AnalysisRequest(**payload))
++    assert data["queue"]["deferred"] == 5
++    assert data["queue"]["critical_overflow"] == 1
++    assert len(data["items"]) == 6
++
++
++def test_new_description_reaches_ml_even_when_amount_is_normal():
++    history = [invoice(id=f"p{i}", invoice_number=f"OLD-{i}", date=f"2026-09-{i:02d}") for i in range(1, 21)]
++    item = result(invoice(description="International consulting annual license subscription"), history)
++    assert item["pipeline"]["recurring_description"]["similarity"] < 0.7
++    assert item["pipeline"]["route"] == "ML_REQUIRED"
++    assert item["pipeline"]["ml_executed"]
++
++
++def test_ties_deterministic_without_mutating_invoice_input():
++    request = AnalysisRequest(invoices=[invoice(id="z", po_number=""), invoice(id="a", supplier_id="other", po_number="")])
++    before = request.model_dump_json()
++    data = analyze(request)
++    assert next(row for row in data["items"] if row["queue"]["tier"] == "REVIEW_NOW")["invoice"]["id"] == "a"
++    assert request.model_dump_json() == before
++    assert allocate(data["items"], request.review_policy)["flagged"] == 2
++
++
++def test_persistence_reuses_database_and_survives_restart(stored_client):
++    client, store = stored_client
++    payload = {"invoices": [invoice(po_number="").model_dump(mode="json")]}
++    response = client.post("/ap/analyze", json=payload)
++    assert response.status_code == 200
++    assert response.json()["audit_persisted"]
++    tables = inspect(store.engine).get_table_names()
++    assert "audit_log" in tables and "ap_invoice_evidence" in tables
++    another = InvoiceAuditStore(type("ExistingStore", (), {"engine": store.engine})())
++    ledger = another.get_recent("default")
++    assert ledger["population"] == 1
++    assert ledger["items"][0]["audit"]["persisted"]
++    with store.engine.connect() as connection:
++        event = connection.execute(select(batches)).one()
++        assert json.loads(event.input_json)["invoices"][0]["id"] == "new"
++        assert json.loads(event.result_json)["items"][0]["priority"]["formula"]
++
++
++def test_multiple_uploads_and_retries_share_budget(stored_client):
++    client, store = stored_client
++    for i in range(3):
++        payload = {"invoices": [invoice(id=str(i), po_number="").model_dump(mode="json")]}
++        data = client.post("/ap/analyze", json=payload).json()
++        assert data["queue"]["population"] == i + 1
++        assert data["queue"]["review_now"] == 1
++    replay = client.post("/ap/analyze", json=payload).json()
++    assert replay["idempotent_replay"]
++    assert replay["queue"]["population"] == 3
++    assert replay["queue"]["monitor"] == 1
++    assert replay["queue"]["deferred"] == 1
++    with store.engine.connect() as connection:
++        assert connection.scalar(select(func.count()).select_from(batches)) == 3
++    assert client.get("/ap/audit?limit=1").json()["has_more"]
++    assert client.get("/ap/audit?tier=ALLOCATED").json()["population"] == 2
++    assert client.get("/ap/audit?limit=0").status_code == 422
++
++
++def test_finalization_freezes_intake_and_policy(stored_client):
++    client, _ = stored_client
++    payload = {"invoices": [invoice(po_number="").model_dump(mode="json")]}
++    assert client.post("/ap/analyze", json=payload).status_code == 200
++    changed = {**payload, "review_policy": {"reviews_per_million": 200}}
++    assert client.post("/ap/analyze", json=changed).status_code == 409
++    assert client.post("/ap/windows/default/finalize").json()["finalized"]
++    assert client.get("/ap/audit").json()["finalized"]
++    new = {"invoices": [invoice(id="newer").model_dump(mode="json")]}
++    assert client.post("/ap/analyze", json=new).status_code == 409
++    assert client.post("/ap/analyze", json=payload).status_code == 200
++    assert client.post("/ap/analyze", json={**new, "window_id": "next"}).status_code == 200
++
++
++def test_save_failure_is_not_reported_as_success(stored_client, monkeypatch):
++    client, store = stored_client
++    def broken(*args):
++        raise RuntimeError("disk unavailable")
++    monkeypatch.setattr(store, "record", broken)
++    assert client.post("/ap/analyze", json={"invoices": [invoice().model_dump(mode="json")]}).status_code == 503
+--- original/START_HERE.md
++++ updated/START_HERE.md
+@@ -1,4 +1,25 @@
+ # CommerceGuard — complete local project
++
++## FinSight frontend update — start here
++
++The default page now recreates the supplied FinSight recording: dark sidebar, invoice explorer,
++exception workbench, investigation dialog, charts, audit view and evidence assistant.
++Read `FINSIGHT_GUIDE.md` for the implemented Member 1/2/3 scope and your partner's API handoff.
++
++Extract this updated package into a **new folder**, keeping your existing Desktop folder intact.
++Run `bash setup.sh`, then `bash start.sh` from this folder and open http://127.0.0.1:8000/.
++Choose a demo persona and click **Enter demo workspace**. The included AP example loads automatically.
++Node is not needed to run the included production frontend.
++
++Invoice analysis now saves its complete evidence into MerchantShield's existing `backend/data/audit.db`.
++The priority queue shares a budget across uploads: 100 human reviews plus 100 monitoring cases per million
++distinct invoices in a named window. Small windows round upward. Import all batches, then open
++**Priority Review Queue** and **Freeze intake & finalize queue** before assigning human tasks.
++Rules/fuzzy matching and a recurring-invoice baseline gate precede unresolved-case ML.
++The observed split is displayed; 70/30 is a target, never a discard quota.
++Authentication and final reviewer decisions remain your partner's work. Demo personas do not enforce permissions.
++
++The following sections describe the previously included CommerceGuard workflows, which remain available.
+ 
+ This folder contains the whole runnable local application: the original MerchantShield fraud model and SHAP dashboard, the trained HGB review model, persistent review operations, spending controls, evidence receipts, source code, datasets, benchmarks and tests. No repository clone, patch application, model training or frontend build is required to run the included demo.
+ 
+--- original/FINSIGHT_GUIDE.md
++++ updated/FINSIGHT_GUIDE.md
+@@ -0,0 +1,137 @@
++# FinSight: invoice fraud triage and bounded review
++
++## Run on your Mac
++
++Extract the updated ZIP into a fresh folder, preserving your partner's existing folder and database.
++Run `bash setup.sh`, then `bash start.sh`. Open http://127.0.0.1:8000/ and enter the demo workspace.
++Python 3.12 or 3.13 is required. The production React build is included; Node and retraining are unnecessary.
++The existing transaction HGB workflow remains at `/reviews` and spending controls at `/commerce`.
++
++## Core workflow
++
++1. Validate schema and run caller-supplied rules, then exact/fuzzy invoice matching.
++2. Keep rule violations and potential duplicates in the complete flagged list. They skip expensive ML fitting.
++3. Early baseline clearance requires no configured violation, at least five strictly earlier supplier/currency records,
++   an amount within three robust deviations, and description similarity at least 0.70 to an earlier supplier record.
++4. Route all remaining unresolved cases to the ML stage. Isolation Forest executes only when at least 20 strictly
++   earlier same-supplier/currency records exist. Missing history gets an explicit exception, never an automatic clearance.
++5. Keep every analyzed invoice and its findings, compare evidence and assign the priority index.
++6. Allocate REVIEW NOW tasks separately from MONITOR cases. Deferred flags remain in the database and audit trail.
++7. After importing the complete population, freeze intake and finalize the queue before assigning human tasks.
++
++The 70% early-stage / 30% ML split is a measured target. The interface displays the actual split and executed-model
++count. It never throws away unresolved invoices to force 30%. Similar invoices can indicate duplicates;
++similarity alone does not certify legitimacy. The baseline and matching thresholds are prototype rules.
++
++## Priority formula and budget
++
++`priority = amount_in_INR × signal_strength × recovery_fraction / review_cost_in_INR`
++
++Signal strength is the invoice's 0–100 maximum-signal triage score divided by 100. It is **not a calibrated fraud
++probability**, so this index is not expected loss or a savings estimate. Defaults are a caller-adjustable recovery
++fraction of 0.5 and review cost of INR 100. Critical cases rank first, then the priority index, then score and invoice ID.
++The monitoring queue prefers remaining medium cases, then exposure priority. Monitoring is not an additional human task.
++
++Within one named window, default capacity is `ceil(distinct_invoice_count × 100 / 1,000,000)` for human review,
++and the same separate capacity for monitoring. At one million invoices this means up to 100 human tasks and 100
++monitors; at six invoices it rounds up to one of each. Repeated requests and additional uploads share the window
++and do not reset its budget. The default window is `default`; supply `window_id` in JSON for an agreed separate period.
++Policies must remain consistent within a window. Separate windows have separate budgets.
++
++Import all batches before **Priority Review Queue → Freeze intake & finalize queue**. Before this step the allocation
++is a preview that can change as more evidence arrives. Finalization freezes intake, making selected tasks stable.
++New input requires a new window; exact retries remain accepted. Your partner owns task assignment and final review
++outcomes. Critical cases outside the budget produce an explicit overflow warning. No deferred invoice is called cleared.
++
++Only INR has a default conversion rate. Supply positive `review_policy.currency_to_inr` rates for other currencies.
++Unpriced cases retain a currency warning and their evidence; monetary ranking is unavailable for them.
++
++## Existing database reuse
++
++The application reuses MerchantShield's SQLite engine and `backend/data/audit.db`. The transaction `audit_log` table
++and its workflow are preserved. Three additive AP tables store named-window policy, complete current invoice evidence,
++and immutable analysis events containing raw input plus the analysis snapshot. No replacement database is created for AP.
++Invoice evidence survives restart. Hash-based request replay prevents duplicate population counts. Window allocation
++is serialized in a SQLite transaction so concurrent uploads cannot independently allocate the same budget.
++
++To keep using an existing local installation's database, preserve its `backend/data/audit.db` and back it up before
++copying updated source/build files, or copy that database into the fresh package's `backend/data/` while the server
++is stopped. Database files and your local business records are deliberately not included in the downloadable ZIP.
++
++The **Audit Trail** displays paginated, persisted invoice evidence: findings, references, measured matching components,
++ML routing/skipping reason, prior-history statistics, priority components, queue disposition, policy version and saved
++timestamp. It also retains the existing transaction-audit view. Export applies to the displayed ledger page;
++use the paginated API to retrieve every invoice. Original analysis snapshots remain in `ap_analysis_events`.
++A database save failure is reported explicitly; the interface does not claim unsaved evidence is persisted.
++
++Authentication, tenant authorization, reviewer identity, final approve/reject decisions and external BI remain your
++partner's scope. Demo personas are presentation choices, not access-control roles. Review handoffs still explicitly
++say `persisted: false` because they are proposed reviewer notes, even though analysis evidence itself is saved.
++The AP Copilot is a deterministic evidence assistant; no conversational LLM is connected.
++
++## API and integration
++
++| Endpoint | Purpose |
++|---|---|
++| `GET /ap/demo` | Fictional six-invoice example and prior history |
++| `POST /ap/analyze` | Analyze inputs and save complete evidence using the existing audit database |
++| `POST /ap/import` | Validate CSV and analyze/save its rows |
++| `GET /ap/audit` | Paginated persisted evidence; `window_id`, `limit`, `offset`, `tier` filters |
++| `POST /ap/windows/{window_id}/finalize` | Freeze intake and finalize the population allocation |
++
++JSON accepts `invoices`, optional `history`, `department_limits`, `watchlist_tax_ids`, `review_policy`, `window_id`.
++An invoice requires `id`, `invoice_number`, `supplier`, `department`, `amount`, `date`, `description`.
++Optional fields: `supplier_id`, `currency` (INR default; USD/EUR/ZAR), `po_number`, `tax_id`.
++Dates use YYYY-MM-DD. Internal IDs must be unique across batch and history. Fraud labels and unknown fields are rejected.
++Limits: 500 incoming invoices, 2,000 history records, 2 MB CSV text. The partner supplies candidate history per batch.
++These limits keep the interactive prototype bounded; million-invoice scoring throughput has not been load-tested.
++The per-million budget arithmetic is tested, not a claim that one API call accepts a million invoices.
++
++`review_policy` fields: `reviews_per_million`, `monitors_per_million`, `review_cost_inr`, `recovery_fraction`,
++`currency_to_inr`. Department limits are INR only. CSV imports use default policy and contain no external history;
++use JSON to supply history, currency rates and a named window. Download the current input from Batch Ingestion.
++
++Matching respects trusted supplier IDs and currency. For non-exact invoice numbers, candidates must fall within
++14 days and 2% amount difference. Near matches require weighted similarity ≥0.78, description ≥0.55 and number ≥0.65.
++Weights: invoice number 0.35, TF-IDF description 0.35, amount 0.20, date 0.10. Exact normalized supplier invoice-number
++repetition remains reviewable when amount/date changes. Matching uses no future records; statistical and recurring
++baseline evidence use strictly earlier dates. Isolation Forest fits 50 trees on log amounts with seed 42.
++
++## Demonstration
++
++The included six invoices produce five exceptions: one human review, one medium monitor, three deferred flagged
++records and one baseline clearance. Four cases are resolved as rule/duplicate findings; one reaches and executes ML
++(16.7%, rather than a forced 30%). Investigate Delta for the side-by-side duplicate evidence, Zenith for the amount
++anomaly, Acme for the critical human task and Azure for medium monitoring. Open the audit trail to show saved evidence.
++Finalize only after you finish importing the intended population.
++
++## Responsibility and source boundaries
++
++| Responsibility | Implemented scope |
++|---|---|
++| Member 1 | Validation, normalization, missing fields, supplied watchlist/limits and cascade gates |
++| Member 2 | Exact/fuzzy duplicate blocking and measured component evidence |
++| Member 3 | Prior-history anomaly evidence, unresolved-case ML and exposure/cost priority |
++| Frontend | Enterprise workspace, complete flagged list, review/monitor queue, investigations and ledger |
++| Database integration | Reuse existing MerchantShield engine; additive AP evidence/window tables |
++| Partner | Auth/tenant boundaries, reviewer decisions, upstream invoice records and external BI |
++
++The original MerchantShield seed-42 synthetic transaction dataset and LightGBM/SHAP artifacts remain included.
++Its 212,960 transaction rows lack invoice numbers, descriptions, PO references and tax identifiers. They do not
++train or validate this AP matching logic. The six AP invoices are fictional fixtures, not a real invoice dataset.
++The calibrated transaction HGB remains separate from this unsupervised invoice amount model. No AP precision,
++recall, real savings, commercial superiority or 200% improvement has been established.
++
++## Changed files and validation
++
++New policy/store files are `backend/invoice_priority.py`, `backend/services/invoice_audit.py` and
++`tests/test_invoice_priority.py`. Updated AP integration is in `backend/invoices.py`, `backend/main.py`,
++`frontend/src/FinSight.jsx`, `frontend/src/api/client.js`, the FinSight stylesheet, production `frontend/dist/`,
++`START_HERE.md` and this guide. No dependency or upstream repository commit was added.
++
++AP tests: **56 passed**. Full non-integration suite: **382 passed, 10 skipped, 6 deselected**.
++Production build and new Python lint pass; frontend lint has two inherited warnings and zero new warnings.
++Final verification results are in `validation/finsight-verification.json`. Startup, AP analysis, database reuse,
++static frontend serving, queue finalization and persisted evidence after restart were checked with the real FastAPI
++application. Million-row throughput and browser-to-live-Python transport are not verified. The included screenshot
++shows the earlier duplicate UI verification; it is not proof of the new queue's live browser transport.

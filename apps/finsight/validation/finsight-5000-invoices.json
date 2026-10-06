@@ -1,0 +1,40 @@
+{
+  "synthetic_invoice_population": 5000,
+  "seconds": 52.48,
+  "summary": {
+    "invoices": 5000,
+    "flagged": 600,
+    "critical": 0,
+    "duplicates": 0,
+    "flagged_exposure_inr": 97500000.0
+  },
+  "cascade": {
+    "total": 5000,
+    "rule_flagged": 100,
+    "baseline_clear": 4400,
+    "ml_routed": 500,
+    "ml_executed": 500,
+    "ml_fraction": 0.1,
+    "target_ml_fraction": 0.3
+  },
+  "queue": {
+    "population": 5000,
+    "flagged": 600,
+    "review_now": 1,
+    "monitor": 1,
+    "deferred": 598,
+    "review_capacity": 1,
+    "monitor_capacity": 1,
+    "policy": {
+      "reviews_per_million": 100,
+      "monitors_per_million": 100,
+      "review_cost_inr": 100.0,
+      "recovery_fraction": 0.5,
+      "currency_to_inr": {
+        "INR": 1.0
+      }
+    },
+    "finalized": false,
+    "critical_overflow": 0
+  }
+}

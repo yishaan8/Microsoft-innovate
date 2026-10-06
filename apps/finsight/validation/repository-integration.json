@@ -1,0 +1,20 @@
+{
+  "repository": "yishaan8/Microsoft-innovate",
+  "base_branch": "member1-data-rule-engine",
+  "base_commit": "48144798b2ecb40c8518da4f578681e34a621630",
+  "integration_branch": "finsight-integration",
+  "root_member1_tests": {
+    "passed": 30
+  },
+  "application_non_integration_tests": {
+    "passed": 385,
+    "skipped": 10,
+    "deselected": 6,
+    "duration_seconds": 47.75
+  },
+  "frontend_build": "passed",
+  "frontend_source_lint": "exit 0; two inherited warnings; generated dist intentionally excluded",
+  "new_python_lint": "passed",
+  "structure": "Application in apps/finsight; root data_processor and tests preserved",
+  "authentication": "GitHub connector reports pull true and push false; remote branch not published"
+}

@@ -1,0 +1,20 @@
+{
+  "repository": "https://github.com/KunalMK25/merchantshield-ai",
+  "upstream_ref": "f9a4333b4136d5d0dfcd3e4cfb018e07a3b3599f",
+  "generator_path": "ml/data/generate_synthetic.py",
+  "generator_git_blob_sha": "ad99c52ad61c2981d3e6a785860d588a85c89bc2",
+  "raw_snapshot": "ml/data/raw_transactions.csv",
+  "raw_sha256": "c20ad5fa2bdbc99d97155037121d9d1f7e38eea5b89bb22515d6e502f35affac",
+  "generator_numeric_seed": 42,
+  "rows": 212960,
+  "frauds": 3200,
+  "nature": "Synthetic transactions generated with unchanged upstream source; not real enterprise transactions",
+  "web_demo": "ml/models/review_queue/web_demo_transactions.csv",
+  "web_demo_rows": 3826,
+  "web_demo_selection": "First 40 customer IDs, labels removed, all historical rows preserved",
+  "model_roles": {
+    "LightGBM": "Upstream frozen individual risk model and SHAP explanations",
+    "HGB": "New calibrated review model trained on the MerchantShield generator snapshot"
+  },
+  "reproduction_note": "Random UUIDs prevent byte-identical regenerated CSV hashes; exact used snapshot is included"
+}

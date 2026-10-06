@@ -1,0 +1,104 @@
+{
+  "health": {
+    "status": "ok",
+    "model_loaded": true,
+    "model_version": "lgbm_v1"
+  },
+  "demo_batch": {
+    "id": "0ca2cca0-93b2-401c-8780-6c7e9922528f",
+    "created_at": "2026-10-06T17:18:58.512741+00:00",
+    "source": "MERCHANTSHIELD_SYNTHETIC_FIRST_40_CUSTOMERS",
+    "dataset_sha256": "51d3af99781cbeb0a93e45fa176d7332e11d3ea4e999b096d3275164ff6df2f3",
+    "model_sha256": "cf7d8ce24fdae0c9e9a34eb64fc385c6166254c3d8283c6b785acdb2c974ab86",
+    "policy": {
+      "version": "loss-review-v1",
+      "currency": "INR",
+      "capacity_per_day": 3,
+      "review_from": null,
+      "cost_assumptions": {
+        "fp_cost": 50.0,
+        "fn_cost_fraction": 0.5
+      },
+      "ranking": "expected_loss",
+      "review_unit": "transaction",
+      "timezone": "UTC"
+    },
+    "history_rows": 3826,
+    "scored_rows": 3826,
+    "review_days": 60,
+    "selected_cases": 180,
+    "negative_benefit_cases": 105,
+    "risk_only_expected_net_benefit": 132648.1160150773,
+    "loss_queue_expected_net_benefit": 148342.79009222015,
+    "scope": "Historical shadow review; modeled benefit is not realized savings. Labels were excluded.",
+    "event_hash": "3a75b5406198b267551a7a1bc35233a05da0c5dea5bc4941c5f4c3e55ef01f94"
+  },
+  "open_cases_before_resolution": 180,
+  "review_receipt": {
+    "amount": 24634.42,
+    "batch_id": "0ca2cca0-93b2-401c-8780-6c7e9922528f",
+    "customer_id": "cust_00020",
+    "daily_rank": 1,
+    "dataset_sha256": "51d3af99781cbeb0a93e45fa176d7332e11d3ea4e999b096d3275164ff6df2f3",
+    "execution": "NONE_HISTORICAL_REVIEW_ONLY",
+    "expected_net_benefit": 12311.520570930232,
+    "explanation": "Selected by estimated loss exposure within daily capacity. Feature values describe context, not SHAP attribution or proof of fraud.",
+    "features": {
+      "account_age_days": 61.74967592592593,
+      "amount": 24634.42,
+      "amount_vs_avg_ratio": 18.694818482707866,
+      "amount_zscore": 7.187703342448602,
+      "day_of_week": 5.0,
+      "failed_ratio_trailing10": 0.1,
+      "hour_of_day": 17.0,
+      "is_night": 0.0,
+      "new_device_flag": 1.0,
+      "new_geo_flag": 1.0,
+      "prior_txn_count": 37.0,
+      "time_since_prev_txn_min": 1303.9333333333334,
+      "velocity_30min": 0.0,
+      "velocity_5min": 0.0,
+      "velocity_60min": 0.0
+    },
+    "fraud_probability": 0.9995399585622169,
+    "id": "3290aa77-e0de-446c-b28f-e733300025ba",
+    "merchant_id": "merch_0143",
+    "model_sha256": "cf7d8ce24fdae0c9e9a34eb64fc385c6166254c3d8283c6b785acdb2c974ab86",
+    "negative_expected_benefit": false,
+    "policy": {
+      "capacity_per_day": 3,
+      "cost_assumptions": {
+        "fn_cost_fraction": 0.5,
+        "fp_cost": 50.0
+      },
+      "currency": "INR",
+      "ranking": "expected_loss",
+      "review_from": null,
+      "review_unit": "transaction",
+      "timezone": "UTC",
+      "version": "loss-review-v1"
+    },
+    "review_day": "2026-04-25",
+    "status": "CLOSED",
+    "timestamp": "2026-04-25T17:59:32+00:00",
+    "transaction_id": "txn_0002130",
+    "outcome": "suspected_fraud",
+    "reviewer": "Demo reviewer",
+    "review_note": "Checked amount, probability and historical features",
+    "reviewed_at": "2026-10-06T17:18:58.845152+00:00",
+    "label_provenance": "HUMAN_DISPOSITION_UNVERIFIED_NOT_TRAINING_LABEL",
+    "event_hash": "72a6be216c61fdde3c641fdc662a426a03a4990909609994c684b0cca5712384"
+  },
+  "exported_case_count": 180,
+  "evidence": {
+    "valid": true,
+    "events": 182,
+    "head_hash": "72a6be216c61fdde3c641fdc662a426a03a4990909609994c684b0cca5712384"
+  },
+  "pages_http_status": {
+    "/": 200,
+    "/commerce": 200,
+    "/reviews": 200
+  },
+  "scope": "Live HTTP verification; no visual browser execution"
+}

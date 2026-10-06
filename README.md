@@ -1,5 +1,17 @@
 # AP Exception Intelligence
 
+## FinSight application and database integration
+
+The complete React/FastAPI application is in [`apps/finsight`](apps/finsight), alongside
+the existing Member 1 data/rule engine. Run `bash setup.sh` and `bash start.sh` from that folder.
+The built frontend, trained transaction models, reproducible synthetic data, AP cascade,
+budgeted review queue and tests are included.
+
+The database teammate should read [`apps/finsight/DATABASE_INTEGRATION.md`](apps/finsight/DATABASE_INTEGRATION.md)
+for the request contract, existing SQLite tables, field mapping and integration boundaries.
+The root procurement pipeline and its existing datasets are preserved. The original
+Member 1 description below remains unchanged.
+
 ## Project Overview
 
 AP Exception Intelligence is a Python-based invoice processing system designed to identify exceptions in procurement invoice data.
