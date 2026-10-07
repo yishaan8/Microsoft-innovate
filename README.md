@@ -62,4 +62,4 @@ data/raw/
 ├── departments.parquet
 └── labels.parquet
 
-[Open FinSight Demo](https://finsight-ap.vercel.app/login)
+https://finsight-ap.vercel.app/login
