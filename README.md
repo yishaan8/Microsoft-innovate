@@ -1,4 +1,5 @@
 # AP Exception Intelligence
+[Open FinSight Demo](https://finsight-ap.vercel.app/login)
 
 ## FinSight application and database integration
 
@@ -62,4 +63,3 @@ data/raw/
 ├── departments.parquet
 └── labels.parquet
 
-https://finsight-ap.vercel.app/login
