@@ -1,0 +1,315 @@
+{
+  "scope": "Synthetic shadow-mode benchmark; not prevented losses or vendor superiority",
+  "splits": {
+    "training": "days 0-34",
+    "calibration": "days 35-39",
+    "selection": "days 40-49",
+    "legacy_development_test": "days 50-59, already examined in prior project experiments"
+  },
+  "review_unit": "one transaction, uniform assumed review time, UTC daily batch",
+  "capacity_per_day": 50,
+  "cost_assumptions": {
+    "fp_cost": 50.0,
+    "fn_cost_fraction": 0.5
+  },
+  "data_sha256": "c20ad5fa2bdbc99d97155037121d9d1f7e38eea5b89bb22515d6e502f35affac",
+  "model_sha256": "cf7d8ce24fdae0c9e9a34eb64fc385c6166254c3d8283c6b785acdb2c974ab86",
+  "trials": [
+    {
+      "leaves": 15,
+      "iterations": 180,
+      "validation": {
+        "risk": {
+          "reviews": 500,
+          "frauds_identified": 433,
+          "false_alerts": 67,
+          "precision": 0.866,
+          "count_recall": 0.7704626334519573,
+          "fraud_value_identified": 1376716.12,
+          "value_recall": 0.8278821825658185,
+          "negative_benefit_reviews": 57,
+          "assumed_cost": 146460.57
+        },
+        "expected_loss": {
+          "reviews": 500,
+          "frauds_identified": 312,
+          "false_alerts": 188,
+          "precision": 0.624,
+          "count_recall": 0.5551601423487544,
+          "fraud_value_identified": 1560576.54,
+          "value_recall": 0.9384458373278968,
+          "negative_benefit_reviews": 0,
+          "assumed_cost": 60580.36
+        }
+      },
+      "pr_auc": 0.8783908789988017,
+      "brier_score": 0.003770588422260931
+    },
+    {
+      "leaves": 31,
+      "iterations": 180,
+      "validation": {
+        "risk": {
+          "reviews": 500,
+          "frauds_identified": 438,
+          "false_alerts": 62,
+          "precision": 0.876,
+          "count_recall": 0.7793594306049823,
+          "fraud_value_identified": 1411242.41,
+          "value_recall": 0.8486444151756176,
+          "negative_benefit_reviews": 44,
+          "assumed_cost": 128947.42
+        },
+        "expected_loss": {
+          "reviews": 500,
+          "frauds_identified": 315,
+          "false_alerts": 185,
+          "precision": 0.63,
+          "count_recall": 0.5604982206405694,
+          "fraud_value_identified": 1563270.56,
+          "value_recall": 0.9400658744038598,
+          "negative_benefit_reviews": 0,
+          "assumed_cost": 59083.35
+        }
+      },
+      "pr_auc": 0.885747604897773,
+      "brier_score": 0.0035747343625625416
+    },
+    {
+      "leaves": 15,
+      "iterations": 300,
+      "validation": {
+        "risk": {
+          "reviews": 500,
+          "frauds_identified": 430,
+          "false_alerts": 70,
+          "precision": 0.86,
+          "count_recall": 0.7651245551601423,
+          "fraud_value_identified": 1402230.6899999997,
+          "value_recall": 0.8432252569963177,
+          "negative_benefit_reviews": 56,
+          "assumed_cost": 133853.28
+        },
+        "expected_loss": {
+          "reviews": 500,
+          "frauds_identified": 312,
+          "false_alerts": 188,
+          "precision": 0.624,
+          "count_recall": 0.5551601423487544,
+          "fraud_value_identified": 1556946.1300000001,
+          "value_recall": 0.9362627062446284,
+          "negative_benefit_reviews": 0,
+          "assumed_cost": 62395.56
+        }
+      },
+      "pr_auc": 0.8754617503058787,
+      "brier_score": 0.0038941379632045944
+    },
+    {
+      "leaves": 31,
+      "iterations": 300,
+      "validation": {
+        "risk": {
+          "reviews": 500,
+          "frauds_identified": 437,
+          "false_alerts": 63,
+          "precision": 0.874,
+          "count_recall": 0.7775800711743772,
+          "fraud_value_identified": 1426782.58,
+          "value_recall": 0.857989428043662,
+          "negative_benefit_reviews": 44,
+          "assumed_cost": 121227.33
+        },
+        "expected_loss": {
+          "reviews": 500,
+          "frauds_identified": 323,
+          "false_alerts": 177,
+          "precision": 0.646,
+          "count_recall": 0.5747330960854092,
+          "fraud_value_identified": 1564467.63,
+          "value_recall": 0.9407857271824297,
+          "negative_benefit_reviews": 0,
+          "assumed_cost": 58084.81
+        }
+      },
+      "pr_auc": 0.8868514671835142,
+      "brier_score": 0.0035602000344018814
+    }
+  ],
+  "selected": {
+    "leaves": 31,
+    "iterations": 300,
+    "validation": {
+      "risk": {
+        "reviews": 500,
+        "frauds_identified": 437,
+        "false_alerts": 63,
+        "precision": 0.874,
+        "count_recall": 0.7775800711743772,
+        "fraud_value_identified": 1426782.58,
+        "value_recall": 0.857989428043662,
+        "negative_benefit_reviews": 44,
+        "assumed_cost": 121227.33
+      },
+      "expected_loss": {
+        "reviews": 500,
+        "frauds_identified": 323,
+        "false_alerts": 177,
+        "precision": 0.646,
+        "count_recall": 0.5747330960854092,
+        "fraud_value_identified": 1564467.63,
+        "value_recall": 0.9407857271824297,
+        "negative_benefit_reviews": 0,
+        "assumed_cost": 58084.81
+      }
+    },
+    "pr_auc": 0.8868514671835142,
+    "brier_score": 0.0035602000344018814
+  },
+  "development": {
+    "risk": {
+      "reviews": 500,
+      "frauds_identified": 456,
+      "false_alerts": 44,
+      "precision": 0.912,
+      "count_recall": 0.6342141863699583,
+      "fraud_value_identified": 933870.7,
+      "value_recall": 0.6438270068387894,
+      "negative_benefit_reviews": 29,
+      "assumed_cost": 260514.36
+    },
+    "expected_loss": {
+      "reviews": 500,
+      "frauds_identified": 354,
+      "false_alerts": 146,
+      "precision": 0.708,
+      "count_recall": 0.49235048678720444,
+      "fraud_value_identified": 1374935.27,
+      "value_recall": 0.9479047361494292,
+      "negative_benefit_reviews": 16,
+      "assumed_cost": 45082.08
+    }
+  },
+  "fresh_streams": [
+    {
+      "seed": 20261007,
+      "transactions": 35442,
+      "frauds": 469,
+      "metrics": {
+        "risk": {
+          "reviews": 500,
+          "frauds_identified": 366,
+          "false_alerts": 134,
+          "precision": 0.732,
+          "count_recall": 0.7803837953091685,
+          "fraud_value_identified": 1716533.04,
+          "value_recall": 0.9124553935377586,
+          "negative_benefit_reviews": 49,
+          "assumed_cost": 89045.51
+        },
+        "expected_loss": {
+          "reviews": 500,
+          "frauds_identified": 309,
+          "false_alerts": 191,
+          "precision": 0.618,
+          "count_recall": 0.6588486140724946,
+          "fraud_value_identified": 1784461.8199999998,
+          "value_recall": 0.9485642130262781,
+          "negative_benefit_reviews": 11,
+          "assumed_cost": 57931.12
+        }
+      },
+      "pr_auc": 0.8286470014818366,
+      "brier_score": 0.0037183312517630345,
+      "raw_sha256": "1494189becf96a5c8c4878aa3dff4cc09cba8184fc427d8a503b0d70cca64b60"
+    },
+    {
+      "seed": 20261008,
+      "transactions": 35979,
+      "frauds": 379,
+      "metrics": {
+        "risk": {
+          "reviews": 500,
+          "frauds_identified": 308,
+          "false_alerts": 192,
+          "precision": 0.616,
+          "count_recall": 0.8126649076517151,
+          "fraud_value_identified": 1864459.45,
+          "value_recall": 0.9117576654349234,
+          "negative_benefit_reviews": 127,
+          "assumed_cost": 99823.67
+        },
+        "expected_loss": {
+          "reviews": 500,
+          "frauds_identified": 288,
+          "false_alerts": 212,
+          "precision": 0.576,
+          "count_recall": 0.7598944591029023,
+          "fraud_value_identified": 1918462.35,
+          "value_recall": 0.9381661550541082,
+          "negative_benefit_reviews": 102,
+          "assumed_cost": 73822.23
+        }
+      },
+      "pr_auc": 0.8873297654286996,
+      "brier_score": 0.0023079583776981698,
+      "raw_sha256": "4662aac03256efee01ea490b75b36b1d33e6e042f5ed465742946a3f79f952da"
+    },
+    {
+      "seed": 20261009,
+      "transactions": 35284,
+      "frauds": 494,
+      "metrics": {
+        "risk": {
+          "reviews": 500,
+          "frauds_identified": 381,
+          "false_alerts": 119,
+          "precision": 0.762,
+          "count_recall": 0.771255060728745,
+          "fraud_value_identified": 1140742.4300000002,
+          "value_recall": 0.895709877303932,
+          "negative_benefit_reviews": 66,
+          "assumed_cost": 72359.99
+        },
+        "expected_loss": {
+          "reviews": 500,
+          "frauds_identified": 322,
+          "false_alerts": 178,
+          "precision": 0.644,
+          "count_recall": 0.6518218623481782,
+          "fraud_value_identified": 1208363.04,
+          "value_recall": 0.9488055163311548,
+          "negative_benefit_reviews": 25,
+          "assumed_cost": 41499.68
+        }
+      },
+      "pr_auc": 0.8446334409931532,
+      "brier_score": 0.003332368546651386,
+      "raw_sha256": "d3e97db37fd707492b07e785aa8bf64df4e5d29e65e5aeb52d47cfa4b89b9825"
+    }
+  ],
+  "versions": {
+    "python": "3.12.14",
+    "sklearn": "1.8.0",
+    "numpy": "2.3.5",
+    "pandas": "2.2.3",
+    "joblib": "1.5.3"
+  },
+  "pooled_fresh": {
+    "risk": {
+      "reviews": 1500,
+      "frauds_identified": 1055,
+      "false_alerts": 445,
+      "fraud_value_identified": 4721734.92,
+      "assumed_cost": 261229.16999999998
+    },
+    "expected_loss": {
+      "reviews": 1500,
+      "frauds_identified": 919,
+      "false_alerts": 581,
+      "fraud_value_identified": 4911287.21,
+      "assumed_cost": 173253.03
+    }
+  },
+  "value_lift_fraction": 0.040144627602262783
+}

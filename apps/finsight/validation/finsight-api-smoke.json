@@ -1,0 +1,37 @@
+{
+  "startup_and_restart": "passed",
+  "audit_database_reuse": "passed",
+  "static_frontend": "HTTP 200",
+  "cascade": {
+    "total": 6,
+    "rule_flagged": 4,
+    "baseline_clear": 1,
+    "ml_routed": 1,
+    "ml_executed": 1,
+    "ml_fraction": 0.16666666666666666,
+    "target_ml_fraction": 0.3,
+    "target_note": "Measured target, not a forced quota. Unresolved cases are never discarded to meet 30%."
+  },
+  "queue": {
+    "population": 6,
+    "flagged": 5,
+    "review_capacity": 1,
+    "monitor_capacity": 1,
+    "review_now": 1,
+    "monitor": 1,
+    "deferred": 3,
+    "critical_overflow": 0,
+    "policy": {
+      "reviews_per_million": 100,
+      "monitors_per_million": 100,
+      "review_cost_inr": 100,
+      "recovery_fraction": 0.5,
+      "currency_to_inr": {
+        "INR": 1.0
+      }
+    },
+    "scope": "shared database window: default",
+    "rounding": "Ceiling after aggregation. At one million: 100 reviews + 100 monitors. Small windows round up.",
+    "finalized": false
+  }
+}

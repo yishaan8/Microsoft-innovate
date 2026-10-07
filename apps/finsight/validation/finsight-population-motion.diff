@@ -1,0 +1,418 @@
+--- previous/backend/invoices.py
++++ current/backend/invoices.py
+@@ -1,6 +1,7 @@
+ """AP cascade; pure analysis plus evidence persistence in the existing audit DB."""
+ 
+ import csv
++import hashlib
+ import io
+ import math
+ import re
+@@ -286,9 +287,40 @@
+         raise HTTPException(status_code=409, detail=str(exc)) from exc
+ 
+ 
++@router.get("/dataset")
++def invoice_dataset(request: Request, window_id: str | None = Query(default=None, pattern=r"^[a-zA-Z0-9_-]{1,64}$"),
++                    limit: int = Query(default=200, ge=1, le=500), offset: int = Query(default=0, ge=0)):
++    store = getattr(request.app.state, "invoice_audit_store", None)
++    if store is None:
++        raise HTTPException(status_code=503, detail="Invoice audit database unavailable.")
++    return store.dataset(window_id, offset, limit)
++
++
++@router.get("/sample")
++def invoice_sample(offset: int = Query(default=0, ge=0, le=4999), limit: int = Query(default=500, ge=1, le=500)):
++    """Reproducible synthetic invoices; no fraud labels or benchmark accuracy claims."""
++    rows, history = [], []
++    for supplier in range(20):
++        base = {"supplier": f"Test Supplier {supplier + 1:02d}", "supplier_id": f"sample-supplier-{supplier}",
++                "department": ["Operations", "IT & Cloud", "Manufacturing", "Supply Chain"][supplier % 4],
++                "currency": "INR", "description": "Monthly contracted maintenance services",
++                "po_number": f"PO-SAMPLE-{supplier}", "tax_id": f"TEST-TAX-{supplier}"}
++        for day in range(1, 21):
++            history.append({**base, "id": f"sample-history-{supplier}-{day}", "invoice_number": f"SETTLED-{supplier}-{day}",
++                            "date": f"2026-09-{day:02d}", "amount": (10000 + supplier * 1000) * (0.96 + day % 5 * .02)})
++    for index in range(offset, min(5000, offset + limit)):
++        supplier = index % 20
++        base = history[supplier * 20]
++        rows.append({**base, "id": f"sample-{index:05d}",
++                     "invoice_number": hashlib.blake2s(f"invoice-{index}".encode(), digest_size=10).hexdigest(),
++                     "date": "2026-10-03", "amount": (10000 + supplier * 1000) * (8 if index % 10 == 9 else 1),
++                     "po_number": "" if index % 50 == 0 else base["po_number"]})
++    return {"invoices": rows, "history": history, "window_id": "synthetic-5000-v1"}
++
++
+ class CsvImport(BaseModel):
+     model_config = ConfigDict(extra="forbid")
+-    csv_text: str = Field(min_length=1, max_length=2_000_000)
++    csv_text: str = Field(min_length=1, max_length=20_000_000)
+ 
+ 
+ @router.post("/import")
+@@ -300,14 +332,32 @@
+             raise ValueError("CSV contains duplicate or unknown columns")
+         rows = []
+         for row in reader:
+-            if len(rows) >= 500:
+-                raise ValueError("Import is limited to 500 invoices")
++            if len(rows) >= 5000:
++                raise ValueError("CSV import is limited to 5,000 invoices; use multiple files in the same window for more")
+             if None in row or any(value is None for value in row.values()):
+                 raise ValueError("CSV row width does not match its header")
+             rows.append(Invoice.model_validate({key: value for key, value in row.items()
+                                                if value != "" or key in {"po_number", "tax_id"}}))
+-        analysis_input = AnalysisRequest(invoices=rows)
+-        return {"input": analysis_input.model_dump(mode="json"), "analysis": persist_analysis(analysis_input, analyze(analysis_input), request)}
++        if not rows:
++            raise ValueError("CSV contains no invoices")
++        if len({row.id for row in rows}) != len(rows):
++            raise ValueError("CSV invoice IDs must be unique")
++        rows.sort(key=lambda row: row.date)
++        combined = []
++        for offset in range(0, len(rows), 500):
++            analysis_input = AnalysisRequest(invoices=rows[offset:offset + 500], history=rows[max(0, offset - 2000):offset])
++            result = persist_analysis(analysis_input, analyze(analysis_input), request)
++            combined.extend(result["items"])
++        store = getattr(request.app.state, "invoice_audit_store", None)
++        if store is not None:
++            result = store.dataset("default")
++        elif len(rows) > 500:
++            result["items"] = combined
++            result["queue"] = allocate(combined, analysis_input.review_policy)
++            result["summary"] = {"invoices": len(combined), "flagged": sum(row["review_required"] for row in combined),
++                                 "duplicates": sum(row["match"] is not None for row in combined),
++                                 "critical": sum(row["severity"] == "CRITICAL" for row in combined)}
++        return {"input": {"invoices": [row.model_dump(mode="json") for row in rows], "window_id": "default"}, "analysis": result}
+     except (ValueError, csv.Error, ValidationError) as exc:
+         raise HTTPException(status_code=422, detail=f"Invalid invoice CSV: {exc}") from exc
+ 
+--- previous/backend/services/invoice_audit.py
++++ current/backend/services/invoice_audit.py
+@@ -12,6 +12,7 @@
+     String,
+     Table,
+     Text,
++    case,
+     func,
+     select,
+ )
+@@ -151,3 +152,42 @@
+             except Exception:
+                 connection.rollback()
+                 raise
++
++    def dataset(self, window_id=None, offset=0, limit=200):
++        with self.engine.connect() as connection:
++            if window_id is None:
++                window_id = connection.scalar(select(batches.c.window_id).order_by(batches.c.created_at.desc()).limit(1))
++            window_id = window_id or "default"
++            scope = invoices.c.window_id == window_id
++            def count_where(condition):
++                return connection.scalar(select(func.count()).select_from(invoices).where(scope, condition))
++            population = count_where(invoices.c.invoice_id.is_not(None))
++            flagged = count_where(invoices.c.flagged == 1)
++            critical = count_where(invoices.c.critical == 1)
++            critical_overflow = count_where((invoices.c.critical == 1) & (invoices.c.tier != "REVIEW_NOW"))
++            duplicate = count_where(func.json_extract(invoices.c.evidence_json, "$.match.kind").is_not(None))
++            routed = count_where(func.json_extract(invoices.c.evidence_json, "$.pipeline.route") == "ML_REQUIRED")
++            executed = count_where(func.json_extract(invoices.c.evidence_json, "$.pipeline.ml_executed") == 1)
++            rule_flagged = count_where(func.json_extract(invoices.c.evidence_json, "$.pipeline.route") == "RULE_FLAGGED")
++            baseline = count_where(func.json_extract(invoices.c.evidence_json, "$.pipeline.route") == "BASELINE_CLEAR")
++            policy_json = connection.scalar(select(windows.c.policy_json).where(windows.c.id == window_id))
++            policy = ReviewPolicy.model_validate_json(policy_json) if policy_json else ReviewPolicy()
++            review_capacity, monitor_capacity = capacities(population, policy)
++            review = count_where(invoices.c.tier == "REVIEW_NOW")
++            monitor = count_where(invoices.c.tier == "MONITOR")
++            exposure = connection.scalar(select(func.sum(case((invoices.c.flagged == 1,
++                case((func.json_extract(invoices.c.evidence_json, "$.invoice.currency") == "INR",
++                      func.json_extract(invoices.c.evidence_json, "$.invoice.amount")), else_=0)), else_=0))).where(scope)) or 0
++            finalized = bool(connection.scalar(select(windows.c.finalized).where(windows.c.id == window_id)))
++        page = self.get_recent(window_id, limit, offset)
++        return {**page, "summary": {"invoices": population, "flagged": flagged, "critical": critical,
++                "duplicates": duplicate, "flagged_exposure_inr": exposure},
++                "queue": {"population": population, "flagged": flagged, "review_now": review, "monitor": monitor,
++                          "deferred": flagged - review - monitor, "review_capacity": review_capacity,
++                          "monitor_capacity": monitor_capacity, "policy": policy.model_dump(), "finalized": finalized,
++                          "critical_overflow": critical_overflow},
++                "cascade": {"total": population, "rule_flagged": rule_flagged, "baseline_clear": baseline,
++                            "ml_routed": routed, "ml_executed": executed, "ml_fraction": routed / population if population else 0,
++                            "target_ml_fraction": 0.3}, "audit_persisted": True,
++                "provenance": "Synthetic invoice test population." if window_id.startswith("synthetic-") else "Persisted invoice records from the selected database window.",
++                "view_scope": "Database-wide totals; charts and filters show the current page."}
+--- previous/frontend/src/FinSight.jsx
++++ current/frontend/src/FinSight.jsx
+@@ -1,4 +1,5 @@
+ import { useCallback, useEffect, useRef, useState } from 'react'
++import { AnimatePresence, MotionConfig, motion } from 'framer-motion'
+ import { api } from './api/client'
+ import TransactionWorkspace from './App'
+ import './styles/FinSight.css'
+@@ -64,7 +65,7 @@
+   return <dialog ref={dialog} className={`fs-dialog ${drawer ? 'drawer' : ''}`} aria-label={title}
+     onCancel={onClose} onClick={(event) => { if (event.target === event.currentTarget) onClose() }}>
+     <div className="fs-dialog-head"><h2>{title}</h2><button className="fs-icon-button" aria-label="Close dialog" onClick={onClose}><Icon name="close"/></button></div>
+-    {children}
++    <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.2 }}>{children}</motion.div>
+   </dialog>
+ }
+ 
+@@ -141,7 +142,7 @@
+ }
+ 
+ function Panel({ title, subtitle, children, action }) {
+-  return <section className="fs-panel"><div className="fs-panel-heading inline"><div><h2>{title}</h2><p>{subtitle}</p></div>{action}</div>{children}</section>
++  return <motion.section initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.22 }} className="fs-panel"><div className="fs-panel-heading inline"><div><h2>{title}</h2><p>{subtitle}</p></div>{action}</div>{children}</motion.section>
+ }
+ 
+ function Investigation({ item, onClose, onHandoff }) {
+@@ -210,6 +211,7 @@
+   const [provenance, setProvenance] = useState('')
+   const [health, setHealth] = useState(null)
+   const [loading, setLoading] = useState(true)
++  const [progress, setProgress] = useState('')
+   const [error, setError] = useState('')
+   const [search, setSearch] = useState('')
+   const [severity, setSeverity] = useState('ALL')
+@@ -226,6 +228,25 @@
+   const [invoiceLedger, setInvoiceLedger] = useState({ items: [], offset: 0, has_more: false })
+   const windowId = input?.window_id || 'default'
+ 
++  const loadSample = useCallback(async () => {
++    setLoading(true)
++    try {
++      for (let offset = 0; offset < 5000; offset += 500) {
++        setProgress(`Analyzing synthetic test invoices ${offset + 1}–${offset + 500} of 5,000…`)
++        await api.analyzeInvoices(await api.getInvoiceSample(offset))
++      }
++      const data = await api.getInvoiceDataset('synthetic-5000-v1')
++      setAnalysis(data); setInput({ window_id: data.window_id }); setProvenance(data.provenance); setError('')
++    } catch (err) { setError(err.message) } finally { setLoading(false); setProgress('') }
++  }, [])
++  const loadSaved = useCallback(async () => {
++    try {
++      const data = await api.getInvoiceDataset()
++      if (!data.population || (data.population === 6 && data.items.every((item) => item.invoice.id.startsWith('demo-')))) return await loadSample()
++      setAnalysis(data); setInput({ window_id: data.window_id }); setProvenance(data.provenance); setError('')
++    } catch (err) { setError(err.message) } finally { setLoading(false) }
++  }, [loadSample])
++
+   const loadDemo = useCallback(async () => {
+     try {
+       const { provenance: source, ...payload } = await api.getInvoiceDemo()
+@@ -234,7 +255,7 @@
+     } catch (err) { setError(err.message) } finally { setLoading(false) }
+   }, [])
+   // oxlint-disable-next-line react/set-state-in-effect -- Synchronize with external API on mount.
+-  useEffect(() => { loadDemo(); api.getHealth().then(setHealth).catch(() => setHealth(null)) }, [loadDemo])
++  useEffect(() => { loadSaved(); api.getHealth().then(setHealth).catch(() => setHealth(null)) }, [loadSaved])
+   useEffect(() => { if (!toast) return; const timer = setTimeout(() => setToast(''), 5000); return () => clearTimeout(timer) }, [toast])
+   const loadAudit = useCallback(async () => {
+     try {
+@@ -248,25 +269,34 @@
+   useEffect(() => { if (['audit', 'review'].includes(page)) loadAudit() }, [page, loadAudit])
+ 
+   async function refresh() {
+-    if (!input) { setLoading(true); return loadDemo() }
++    if (!input) { setLoading(true); return loadSaved() }
+     setLoading(true); setError('')
+-    try { setAnalysis(await api.analyzeInvoices(input)); setToast('Analysis refreshed from the current input.') } catch (err) { setError(err.message) } finally { setLoading(false) }
++    try { setAnalysis(await api.getInvoiceDataset(windowId)); setToast('Saved population refreshed from the database.') } catch (err) { setError(err.message) } finally { setLoading(false) }
+   }
+   async function importFile(file) {
+     // Review intake must be finalized only after all batches have been imported.
+     if (!file) return
+-    if (file.size > 2_000_000) { setError('Choose a CSV or JSON file smaller than 2 MB.'); return }
++    if (file.size > 20_000_000) { setError('Choose a CSV or JSON file smaller than 20 MB.'); return }
+     setLoading(true); setError('')
+     try {
+       const text = await file.text()
+       if (file.name.toLowerCase().endsWith('.csv')) {
+         const result = await api.importInvoices(text); setInput(result.input); setAnalysis(result.analysis)
+       } else if (file.name.toLowerCase().endsWith('.json')) {
+-        const payload = JSON.parse(text); const result = await api.analyzeInvoices(payload); setInput(payload); setAnalysis(result)
++        const payload = JSON.parse(text)
++        if (!Array.isArray(payload.invoices) || !payload.invoices.length || payload.invoices.length > 5000) throw new Error('JSON must contain 1–5,000 invoices.')
++        if (new Set(payload.invoices.map((row) => row.id)).size !== payload.invoices.length) throw new Error('Invoice IDs must be unique.')
++        const rows = [...payload.invoices].sort((a, b) => a.date.localeCompare(b.date))
++        for (let offset = 0; offset < rows.length; offset += 500) {
++          setProgress(`Importing invoices ${offset + 1}–${Math.min(offset + 500, rows.length)} of ${rows.length}…`)
++          const history = [...(payload.history || []), ...rows.slice(Math.max(0, offset - 2000), offset)].slice(-2000)
++          await api.analyzeInvoices({ ...payload, invoices: rows.slice(offset, offset + 500), history })
++        }
++        setInput(payload); setAnalysis(await api.getInvoiceDataset(payload.window_id || 'default'))
+       } else { throw new Error('Choose a .csv or .json file.') }
+       setProvenance(`Imported file: ${file.name}. Results depend on the supplied history and policy.`)
+       setUpload(false); navigate('invoices'); setToast('Batch analyzed successfully.')
+-    } catch (err) { setError(err.message) } finally { setLoading(false) }
++    } catch (err) { setError(err.message) } finally { setLoading(false); setProgress('') }
+   }
+   async function finalizeQueue() {
+     try {
+@@ -278,6 +308,11 @@
+   async function changeLedgerPage(offset) {
+     try { setInvoiceLedger(await api.getInvoiceAudit(input?.window_id || 'default', offset, page === 'review' ? 'ALLOCATED' : 'ALL')); setAuditError('') }
+     catch (err) { setAuditError(err.message) }
++  }
++  async function changeDatasetPage(offset) {
++    setLoading(true)
++    try { setAnalysis(await api.getInvoiceDataset(windowId, offset)) } catch (err) { setError(err.message) }
++    finally { setLoading(false) }
+   }
+   function navigate(next) {
+     setPage(next); setMenu(false); setSearch(''); setSeverity('ALL'); setStatus('ALL'); setRule('ALL'); setDepartment('ALL')
+@@ -290,18 +325,18 @@
+       && (status === 'ALL' || status === item.status) && (department === 'ALL' || department === item.invoice.department)
+       && (rule === 'ALL' || item.signals.some((signal) => signal.code === rule))
+   })
+-  const exposure = flagged.filter((item) => item.invoice.currency === 'INR').reduce((sum, item) => sum + item.invoice.amount, 0)
++  const exposure = analysis?.summary?.flagged_exposure_inr ?? flagged.filter((item) => item.invoice.currency === 'INR').reduce((sum, item) => sum + item.invoice.amount, 0)
+   const registryItems = visible.filter((item) => page !== 'exceptions' || item.review_required)
+ 
+-  if (login) return <div className="fs-login"><div className="fs-login-wrap"><Brand large/><h1>Accounts Payable Exception Intelligence</h1>
++  if (login) return <MotionConfig reducedMotion="user"><motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="fs-login"><div className="fs-login-wrap"><Brand large/><h1>Accounts Payable Exception Intelligence</h1>
+     <div className="fs-login-card"><label className="fs-label">SELECT DEMO ROLE PERSONA</label>
+       <div className="fs-role-options">{['Analyst', 'Admin', 'Auditor'].map((persona) => <button key={persona} className={role === persona ? 'selected' : ''} onClick={() => setRole(persona)}><strong>{persona}</strong><small>{persona === 'Analyst' ? 'Investigations' : persona === 'Admin' ? 'Workspace overview' : 'Compliance'}</small></button>)}</div>
+       <label className="fs-label">Workspace user<input value="Tulsi Tomar" readOnly/></label>
+       <button className="fs-primary fs-enter" onClick={() => setLogin(false)}>Enter demo workspace</button>
+       <div className="fs-login-footer"><Icon name="shield" size={15}/><span>Demo personas · authentication integration pending</span></div>
+-    </div></div></div>
+-
+-  return <div className="finsight">
++    </div></div></motion.div></MotionConfig>
++
++  return <MotionConfig reducedMotion="user" transition={{ duration: 0.2, ease: 'easeOut' }}><div className="finsight">
+     <aside className={`fs-sidebar ${menu ? 'open' : ''}`}><Brand/>
+       <div className="fs-persona"><span className="fs-dot"/><div><strong>Tulsi Tomar</strong><small>ROLE: {role.toUpperCase()} · DEMO</small></div></div>
+       <div className="fs-nav-label">CORE MODULES</div>
+@@ -319,18 +354,18 @@
+         <button className="fs-user" onClick={() => setLogin(true)}><span>TT</span>Tulsi Tomar</button>
+       </div>
+     </header>
+-    <main className="fs-content" aria-busy={loading}>
++    <AnimatePresence mode="wait" initial={false}><motion.main key={page} initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }} className="fs-content" aria-busy={loading}>
+       <div className="fs-page-heading"><div><h1><Icon name={NAV.find((entry) => entry[0] === page)?.[2] || 'grid'} size={25}/>{TITLES[page]}</h1><p>{page === 'audit' ? 'Complete invoice evidence saved in the existing MerchantShield database.' : 'Invoice validation, matching evidence and bounded human review.'}</p></div>
+         <div className="fs-heading-actions"><button disabled={loading} onClick={['audit', 'review'].includes(page) ? loadAudit : refresh}><Icon name="refresh"/>{loading ? 'Analyzing…' : 'Refresh'}</button><button disabled={!analysis} onClick={() => download(page === 'audit' ? 'finsight-audit-page.json' : 'finsight-analysis.json', page === 'audit' ? invoiceLedger : { ...analysis, provenance })}><Icon name="download"/>Export {page === 'audit' ? 'ledger page' : 'evidence'}</button></div>
+       </div>
+       {error && <div className="fs-error" role="alert">{error}<button onClick={() => setError('')} aria-label="Dismiss error"><Icon name="close" size={16}/></button></div>}
+-      {loading && <div className="fs-loading" role="status">Analyzing invoice rules, matches and supplier history…</div>}
++      {loading && <div className="fs-loading" role="status">{progress || 'Loading saved invoice evidence…'}</div>}
+       {analysis?.audit_warning && <div className="fs-error" role="alert">{analysis.audit_warning}</div>}
+       {analysis?.queue?.critical_overflow > 0 && <div className="fs-error" role="alert">{analysis.queue.critical_overflow} critical cases outside the human review budget. Their flags and evidence remain stored; adjust capacity with your team.</div>}
+-      {!['transactions', 'audit'].includes(page) && <div className="fs-source"><span className="fs-source-tag">{provenance.startsWith('Imported') ? 'IMPORTED BATCH' : 'SYNTHETIC AP DEMO'}</span><span>{provenance}</span></div>}
++      {!['transactions', 'audit'].includes(page) && <div className="fs-source"><span className="fs-source-tag">{windowId.startsWith('synthetic-') || provenance.includes('Fictional') ? 'SYNTHETIC TEST DATA' : 'DATABASE RECORDS'}</span><span>{provenance} {analysis?.view_scope}</span><button disabled={loading} onClick={loadSample}>Load 5,000 test invoices</button></div>}
+ 
+       {page === 'dashboard' && <>
+-        <div className="fs-kpi-grid">{[[items.length, 'Invoices analyzed', 'Current batch'], [flagged.length, 'Flagged invoices', 'Complete evidence retained'], [analysis?.queue?.review_now || 0, 'Human review tasks', 'Shared window · 100 per million'], [analysis?.queue?.monitor || 0, 'Monitoring cases', 'Separate from human tasks'], [money(exposure), 'Flagged exposure · INR', 'Invoice value, not realized savings']].map(([value, label, context]) => <article className="fs-kpi" key={label}><small>{label}</small><strong>{value}</strong><span>{context}</span></article>)}</div>
++        <div className="fs-kpi-grid">{[[analysis?.summary?.invoices || 0, 'Invoices analyzed', 'Complete selected window'], [analysis?.summary?.flagged || 0, 'Flagged invoices', 'Complete evidence retained'], [analysis?.queue?.review_now || 0, 'Human review tasks', 'Shared window · 100 per million'], [analysis?.queue?.monitor || 0, 'Monitoring cases', 'Separate from human tasks'], [money(exposure), 'Flagged exposure · INR', 'Invoice value, not realized savings']].map(([value, label, context], index) => <motion.article initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: index * 0.035 }} whileHover={{ y: -2 }} className="fs-kpi" key={label}><small>{label}</small><strong>{value}</strong><span>{context}</span></motion.article>)}</div>
+         <Panel title="Detection Funnel & Review Budget" subtitle="Rules and fuzzy matching first · unresolved cases proceed to ML"><p>{analysis?.cascade?.rule_flagged || 0} rule / duplicate findings · {analysis?.cascade?.baseline_clear || 0} baseline clears · {analysis?.cascade?.ml_routed || 0} routed to ML ({pct(analysis?.cascade?.ml_fraction || 0)} observed; 30% target).</p><p>{analysis?.queue?.population || 0} distinct invoices in window · {analysis?.queue?.deferred || 0} deferred flags retained. Tiny windows round upward. Similarity identifies potential duplicates; it does not certify legitimacy.</p><button onClick={() => navigate('review')}>Open priority review queue <Icon name="chevron" size={14}/></button></Panel>
+         <div className="fs-tabs" role="tablist" aria-label="Dashboard view">{[['overview', 'Surveillance Overview'], ['rules', 'Rule Frequency & Cost Centers'], ['suppliers', 'Supplier Risk Matrix']].map(([key, label]) => <button key={key} role="tab" aria-selected={tab === key} onClick={() => setTab(key)}>{label}</button>)}<span>{items.length} INVOICES · CURRENT BATCH</span></div>
+         {tab !== 'suppliers' ? <div className="fs-chart-grid"><Panel title={tab === 'overview' ? 'Invoice Volume & Exception Classification (7-Day)' : 'Rule Detection Frequency'} subtitle="Computed from the currently analyzed batch">{tab === 'overview' ? <Trend items={items}/> : <RuleChart items={items}/>}</Panel><Panel title="Department Risk Exposure" subtitle="Flagged invoice concentration across cost centers"><DepartmentChart items={items}/></Panel></div>
+@@ -339,6 +374,7 @@
+       </>}
+ 
+       {(page === 'invoices' || page === 'exceptions') && <>
++        <div className="fs-heading-actions"><span>{analysis?.summary?.invoices || 0} saved invoices · showing {items.length} on this page</span><button disabled={loading || !analysis?.offset} onClick={() => changeDatasetPage(Math.max(0, (analysis?.offset || 0) - 200))}>Previous page</button><button disabled={loading || !analysis?.has_more} onClick={() => changeDatasetPage((analysis?.offset || 0) + 200)}>Next page</button></div>
+         <section className="fs-panel fs-filters"><div className="fs-filter-line"><label className="fs-search"><Icon name="search"/><input value={search} onChange={(event) => setSearch(event.target.value)} aria-label="Filter invoice results" placeholder="Search by invoice number, supplier name, or rule reason…"/></label>
+           {page === 'exceptions' ? <select aria-label="Rule filter" value={rule} onChange={(event) => setRule(event.target.value)}><option value="ALL">All Automated Rules</option>{Object.entries(LABELS).map(([key, label]) => <option key={key} value={key}>{label}</option>)}</select> : <select aria-label="Department filter" value={department} onChange={(event) => setDepartment(event.target.value)}><option value="ALL">All Departments</option>{[...new Set(items.map((item) => item.invoice.department))].map((name) => <option key={name}>{name}</option>)}</select>}
+         </div><div className="fs-filter-chips"><span><Icon name="filter" size={14}/>{page === 'exceptions' ? 'Severity Filter:' : 'Status:'}</span>{(page === 'exceptions' ? ['ALL', 'CRITICAL', 'HIGH', 'MEDIUM', 'LOW'] : ['ALL', 'FLAGGED', 'CLEARED']).map((value) => <button key={value} className={(page === 'exceptions' ? severity : status) === value ? 'selected' : ''} onClick={() => page === 'exceptions' ? setSeverity(value) : setStatus(value)}>{value}</button>)}</div></section>
+@@ -361,15 +397,15 @@
+         <Panel title="Event Verification Stream" subtitle="Recent transaction decisions from the existing backend"><div className="fs-audit-stream">{audit.map((event, index) => <article key={event.request_id || index}><span className="fs-audit-icon"><Icon name="shield"/></span><div><div className="fs-audit-head"><strong>MerchantShield decision engine</strong><small>{event.timestamp || event.created_at || ''}</small></div><Badge value={event.action || 'RECORDED'}/><p>Transaction {event.transaction_id || '—'}</p><p>{event.policy_reason || event.reason || 'Inspect the complete record for decision evidence.'}</p><details><summary>Inspect stored record</summary><pre>{JSON.stringify(event, null, 2)}</pre></details></div></article>)}{!audit.length && <div className="fs-empty">No transaction audit records yet. Run a transaction evaluation to create one.</div>}</div></Panel>
+       </>}
+       {page === 'transactions' && <div className="fs-legacy"><TransactionWorkspace/></div>}
+-    </main><footer className="fs-content-footer">FinSight · Bounded review, complete evidence<span>No automatic payment actions</span></footer></div>
++    </motion.main></AnimatePresence><footer className="fs-content-footer">FinSight · Bounded review, complete evidence<span>No automatic payment actions</span></footer></div>
+ 
+     {selected && <Investigation item={selected} onClose={() => setSelected(null)} onHandoff={(handoff) => { download(`review-handoff-${handoff.invoice_id}.json`, handoff); setToast('Review handoff downloaded. No decision was saved.'); setSelected(null) }}/ >}
+     {copilot && <Copilot items={items} onClose={() => setCopilot(false)}/ >}
+-    {upload && <Modal title="Batch Ingestion" onClose={() => setUpload(false)}><p className="fs-subtitle">Analyze up to 500 invoices. JSON can include supplier history and policy.</p>
+-      <div className="fs-upload-area"><Icon name="upload" size={36}/><h3>Upload an invoice batch</h3><p>CSV or JSON · maximum 2 MB</p><label className="fs-upload-input">Choose file<input type="file" accept=".csv,.json" disabled={loading} onChange={(event) => importFile(event.target.files?.[0])}/></label></div>
++    {upload && <Modal title="Batch Ingestion" onClose={() => setUpload(false)}><p className="fs-subtitle">Import up to 5,000 invoices per file; processed in batches of 500. JSON can include history and policy.</p>
++      <div className="fs-upload-area"><Icon name="upload" size={36}/><h3>Upload an invoice batch</h3><p>CSV or JSON · maximum 20 MB</p><label className="fs-upload-input">Choose file<input type="file" accept=".csv,.json" disabled={loading} onChange={(event) => importFile(event.target.files?.[0])}/></label></div>
+       {error && <p className="fs-error" role="alert">{error}</p>}
+-      <div className="fs-upload-info"><h3>Required invoice columns</h3><code>id, invoice_number, supplier, department, amount, date, description</code><p>Optional: supplier_id, currency, po_number, tax_id. Dates use YYYY-MM-DD. CSV has no external history or department limits; use JSON to supply them.</p><button disabled={!input} onClick={() => download('finsight-input-template.json', input)}>Download current input as JSON</button><button disabled={loading} onClick={async () => { setLoading(true); await loadDemo(); setUpload(false) }}>Load included demonstration</button></div>
++      <div className="fs-upload-info"><h3>Required invoice columns</h3><code>id, invoice_number, supplier, department, amount, date, description</code><p>Optional: supplier_id, currency, po_number, tax_id. Dates use YYYY-MM-DD. CSV has no external history or department limits; use JSON to supply them.</p><button disabled={!input} onClick={() => download('finsight-input-template.json', { invoices: items.map((row) => row.invoice), history: [], window_id: 'new-import-window' })}>Download displayed invoice template</button><button disabled={loading} onClick={async () => { setLoading(true); await loadDemo(); setUpload(false) }}>Load included demonstration</button></div>
+     </Modal>}
+-    {toast && <div className="fs-toast" role="status">{toast}</div>}
+-  </div>
+-}
++    <AnimatePresence>{toast && <motion.div initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }} className="fs-toast" role="status">{toast}</motion.div>}</AnimatePresence>
++  </div></MotionConfig>
++}
+--- previous/frontend/src/styles/FinSight.css
++++ current/frontend/src/styles/FinSight.css
+@@ -1,4 +1,4 @@
+-:root { font-family: Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; color:#111827; background:#f7f8fb; font-synthesis:none }
++:root { font-family: Helvetica,"Helvetica Neue",Arial,sans-serif; color:#111827; background:#f7f8fb; font-synthesis:none }
+ * { box-sizing:border-box } body { margin:0 } button,input,select,textarea { font:inherit }
+ button { cursor:pointer } button:disabled { cursor:wait; opacity:.55 }
+ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible { outline:3px solid #84a4ff; outline-offset:3px }
+@@ -189,3 +189,7 @@
+ .fs-content details { margin: 12px 20px; font-size: 12px; }
+ .fs-content details summary { cursor: pointer; padding: 8px 0; }
+ .fs-content details pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 380px; overflow: auto; background: #f4f6fa; padding: 12px; border-radius: 6px; }
++
++.finsight,.fs-login,.fs-dialog { font-family: Helvetica,"Helvetica Neue",Arial,sans-serif; }
++.finsight button,.fs-dialog button { transition: background-color .18s ease, border-color .18s ease, box-shadow .18s ease; }
++@media (prefers-reduced-motion: reduce) { .finsight button,.fs-dialog button { transition: none; } }
+--- previous/frontend/src/api/client.js
++++ current/frontend/src/api/client.js
+@@ -47,6 +47,8 @@
+ 
+ export const api = {
+   getInvoiceDemo: () => request("/ap/demo"),
++  getInvoiceSample: (offset) => request(`/ap/sample?offset=${offset}&limit=500`),
++  getInvoiceDataset: (windowId, offset = 0) => request(`/ap/dataset?offset=${offset}&limit=200${windowId ? `&window_id=${encodeURIComponent(windowId)}` : ''}`),
+   analyzeInvoices: (payload) => request("/ap/analyze", { method: "POST", body: JSON.stringify(payload) }),
+   importInvoices: (csv_text) => request("/ap/import", { method: "POST", body: JSON.stringify({ csv_text }) }),
+   getInvoiceAudit: (windowId = 'default', offset = 0, tier = 'ALL') => request(`/ap/audit?window_id=${encodeURIComponent(windowId)}&limit=200&offset=${offset}&tier=${tier}`),
+--- previous/frontend/package.json
++++ current/frontend/package.json
+@@ -10,6 +10,7 @@
+     "preview": "vite preview"
+   },
+   "dependencies": {
++    "framer-motion": "^14.0.0",
+     "react": "^19.2.8",
+     "react-dom": "^19.2.8"
+   },
+--- previous/tests/test_invoice_priority.py
++++ current/tests/test_invoice_priority.py
+@@ -166,3 +166,37 @@
+         raise RuntimeError("disk unavailable")
+     monkeypatch.setattr(store, "record", broken)
+     assert client.post("/ap/analyze", json={"invoices": [invoice().model_dump(mode="json")]}).status_code == 503
++
++
++def test_database_totals_and_pagination_are_population_wide(stored_client):
++    client, _ = stored_client
++    for i in range(3):
++        assert client.post("/ap/analyze", json={"invoices": [invoice(id=str(i), po_number="").model_dump(mode="json")]}).status_code == 200
++    page = client.get("/ap/dataset?limit=1&offset=1").json()
++    assert page["summary"]["invoices"] == page["summary"]["flagged"] == 3
++    assert len(page["items"]) == 1 and page["has_more"]
++    assert page["summary"]["flagged_exposure_inr"] == 3000
++    assert page["queue"]["review_now"] == 1
++    assert page["cascade"]["rule_flagged"] == 3
++
++
++def test_synthetic_population_has_five_thousand_unique_invoices(stored_client):
++    client, _ = stored_client
++    ids = set()
++    for offset in range(0, 5000, 500):
++        payload = client.get(f"/ap/sample?offset={offset}").json()
++        request = AnalysisRequest.model_validate(payload)
++        ids.update(row.id for row in request.invoices)
++        assert len(request.history) == 400
++    assert len(ids) == 5000
++    assert client.get("/ap/sample?offset=5000").status_code == 422
++
++
++def test_csv_import_processes_more_than_five_hundred_rows(stored_client):
++    client, _ = stored_client
++    rows = ['id,invoice_number,supplier,supplier_id,department,amount,date,description,po_number,tax_id']
++    rows.extend(f'{i},REF-{i},Supplier {i},s{i},Operations,1000,2026-10-03,Services,,TAX' for i in range(501))
++    data = client.post('/ap/import', json={'csv_text': '\n'.join(rows)})
++    assert data.status_code == 200, data.text
++    assert data.json()['analysis']['summary']['invoices'] == 501
++    assert client.get('/ap/dataset?offset=400').json()['population'] == 501
